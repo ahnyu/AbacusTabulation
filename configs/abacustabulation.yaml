@@ -92,6 +92,7 @@ paircounts:
 
 # Example HOD block for Python-side clustering calls.
 # abacustabulation.galaxy_correlation_from_config(...) reads this block.
+# HOD parameter names are canonical-only; aliases such as logM_cut or pmax are rejected.
 hod:
   model: lrg
   n_subbins: 20
@@ -101,4 +102,4 @@ hod:
     logM1: 14.0
     kappa: 1.0
     alpha: 1.0
-    pmax: 1.0
+    a_c: 1.0

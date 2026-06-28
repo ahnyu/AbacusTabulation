@@ -231,12 +231,8 @@ def smu_bin_volumes(s_edges: np.ndarray, mu_edges: np.ndarray) -> np.ndarray:
     return (4.0 * np.pi / 3.0) * d_s3[:, None] * d_mu[None, :]
 
 
-def analytic_random_paircounts(
-    paircounts: PairCountTable,
-    n_galaxies_a: float,
-    n_galaxies_b: float | None = None,
-) -> np.ndarray:
-    """Analytic random pair counts for a periodic box."""
+def random_geometry_factor(paircounts: PairCountTable) -> np.ndarray:
+    """Return periodic-box random geometry factor, bin_volume / box_volume."""
 
     boxsize = float(paircounts.attrs["boxsize"])
     box_volume = boxsize**3
@@ -246,12 +242,21 @@ def analytic_random_paircounts(
         bin_volume = smu_bin_volumes(paircounts.bins["s_edges"], paircounts.bins["mu_edges"])
     else:
         raise ValueError(f"Unknown clustering type {paircounts.clustering!r}.")
+    return bin_volume / box_volume
+
+
+def analytic_random_paircounts(
+    paircounts: PairCountTable,
+    n_galaxies_a: float,
+    n_galaxies_b: float | None = None,
+) -> np.ndarray:
+    """Analytic random pair counts for a periodic box."""
 
     if n_galaxies_b is None:
         norm = float(n_galaxies_a) ** 2
     else:
         norm = float(n_galaxies_a) * float(n_galaxies_b)
-    return norm * bin_volume / box_volume
+    return norm * random_geometry_factor(paircounts)
 
 
 class HODClusteringTabulator:
@@ -265,6 +270,7 @@ class HODClusteringTabulator:
             self.n_subbins,
         )
         self.bin_shape = tuple(paircounts.counts_hh.shape[2:])
+        self.random_geometry = random_geometry_factor(paircounts)
         self._hh = self._flatten_counts(paircounts.counts_hh)
         self._hp = self._flatten_counts(paircounts.counts_hp)
         self._pp = self._flatten_counts(paircounts.counts_pp)
@@ -327,7 +333,7 @@ class HODClusteringTabulator:
     ) -> GalaxyClusteringResult:
         weights = self.hod_weights(hod_params, hod_model=hod_model)
         dd = self.weighted_paircounts(weights)
-        rr = analytic_random_paircounts(self.paircounts, weights.n_galaxies)
+        rr = weights.n_galaxies**2 * self.random_geometry
         xi = np.divide(dd, rr, out=np.full_like(dd, np.nan, dtype=np.float64), where=rr > 0.0) - 1.0
         boxsize = float(self.paircounts.attrs["boxsize"])
         return GalaxyClusteringResult(
@@ -351,7 +357,7 @@ class HODClusteringTabulator:
         weights_a = self.hod_weights(hod_params_a, hod_model=hod_model_a)
         weights_b = self.hod_weights(hod_params_b, hod_model=hod_model_b)
         dd = self.weighted_paircounts(weights_a, weights_b)
-        rr = analytic_random_paircounts(self.paircounts, weights_a.n_galaxies, weights_b.n_galaxies)
+        rr = weights_a.n_galaxies * weights_b.n_galaxies * self.random_geometry
         xi = np.divide(dd, rr, out=np.full_like(dd, np.nan, dtype=np.float64), where=rr > 0.0) - 1.0
         boxsize = float(self.paircounts.attrs["boxsize"])
         return GalaxyClusteringResult(

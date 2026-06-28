@@ -706,8 +706,9 @@ def prepare_from_config(
         output_path = Path(output_root) / sim_name / z_directory(z_mock)
 
     requested_slabs = slab_indices
-    if requested_slabs is None and "slab_indices" in prepare_params:
-        requested_slabs = [int(index) for index in prepare_params["slab_indices"]]
+    config_slabs = prepare_params.get("slab_indices")
+    if requested_slabs is None and config_slabs is not None:
+        requested_slabs = [int(index) for index in config_slabs]
 
     position_space_config = prepare_params.get("position_space")
     if position_space_config is None:
