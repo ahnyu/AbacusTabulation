@@ -50,7 +50,7 @@ def sigma(params: Mapping[str, Any]) -> float:
 
 
 def a_c(params: Mapping[str, Any]) -> float:
-    return float(param(params, "a_c"))
+    return float(param(params, "a_c", default=1.0))
 
 
 def alpha(params: Mapping[str, Any]) -> float:
@@ -61,8 +61,8 @@ def kappa(params: Mapping[str, Any]) -> float:
     return float(param(params, "kappa"))
 
 
-def asat(params: Mapping[str, Any]) -> float:
-    return float(param(params, "A_s", default=1.0))
+def a_s(params: Mapping[str, Any]) -> float:
+    return float(param(params, "a_s", default=1.0))
 
 
 def n_cen_zheng(

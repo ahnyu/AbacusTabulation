@@ -96,7 +96,7 @@ def evaluate_hod(
     """Return ``(N_central, N_satellite)`` for a named vectorized HOD model.
 
     Canonical parameter names are intentionally strict and model-specific. Use
-    ``a_c`` for central amplitude and ``A_s`` for satellite amplitude. Add
+    ``a_c`` for central amplitude and ``a_s`` for satellite amplitude. Add
     a new model by creating ``hod_models/<model_name>.py`` with ``PARAMETERS``
     and ``evaluate(mass, params)``.
     """

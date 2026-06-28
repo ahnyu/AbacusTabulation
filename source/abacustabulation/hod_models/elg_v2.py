@@ -7,10 +7,10 @@ from typing import Any
 
 import numpy as np
 
-from .base import a_c, alpha, asat, kappa, logm_cut, m1, m_cut, n_cen_elg_v2, n_sat_generic, param, sigma
+from .base import a_c, a_s, alpha, kappa, logm_cut, m1, m_cut, n_cen_elg_v2, n_sat_generic, param, sigma
 
 
-PARAMETERS = {"logMcut", "sigma", "a_c", "logM1", "alpha", "kappa", "A_s", "gamma"}
+PARAMETERS = {"logMcut", "sigma", "a_c", "logM1", "alpha", "kappa", "a_s", "gamma"}
 
 
 def evaluate(mass: np.ndarray, params: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray]:
@@ -27,6 +27,6 @@ def evaluate(mass: np.ndarray, params: Mapping[str, Any]) -> tuple[np.ndarray, n
         kappa(params),
         m1(params),
         alpha(params),
-        a_s=asat(params),
+        a_s=a_s(params),
     )
     return central, satellite
