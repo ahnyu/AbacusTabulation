@@ -634,6 +634,13 @@ def prepare_all_slabs(
         return [future.result() for future in concurrent.futures.as_completed(futures)]
 
 
+def _first_not_none(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
 def _format_output_dir(template: str, *, sim_name: str, z_mock: float) -> Path:
     return Path(template.format(sim_name=sim_name, z=z_directory(z_mock), z_mock=z_mock))
 
@@ -646,8 +653,22 @@ def prepare_from_config(
     seed: int | None = None,
     overwrite: bool | None = None,
     slab_indices: list[int] | None = None,
+    output_dir: str | os.PathLike[str] | None = None,
+    n_parallel: int | None = None,
+    position_space: str | None = None,
+    los_axis: Axis | None = None,
+    box_origin: str | None = None,
+    nfw_count_factor: float | None = None,
+    min_particles_per_halo: int | None = None,
+    max_particles_per_halo: int | None = None,
+    satellite_velocity_model: str | None = None,
     concentration_numerator_key: str | None = None,
     concentration_denominator_key: str | None = None,
+    position_dtype: str | np.dtype | type | None = None,
+    index_dtype: str | np.dtype | type | None = None,
+    particle_chunk_size: int | None = None,
+    write_particle_radius: bool | None = None,
+    hdf5_compression: str | None = None,
 ) -> list[PreparedSlabPaths]:
     """Prepare profile catalogs from a YAML config.
 
@@ -661,64 +682,111 @@ def prepare_from_config(
         config = yaml.safe_load(handle)
 
     sim_params = config.get("sim_params", {})
+    paths_params = config.get("paths", {})
     prepare_params = config.get("prepare_profiles", {})
 
     sim_name = alt_simname or sim_params["sim_name"]
     z_mock = float(alt_z if alt_z is not None else sim_params["z_mock"])
     sim_dir = sim_params["sim_dir"]
 
-    if "output_dir" in prepare_params:
-        output_dir = _format_output_dir(
-            str(prepare_params["output_dir"]), sim_name=sim_name, z_mock=z_mock
-        )
+    output_value = _first_not_none(
+        output_dir,
+        prepare_params.get("output_dir"),
+        paths_params.get("prepared_dir"),
+    )
+    if output_value is not None:
+        output_path = _format_output_dir(str(output_value), sim_name=sim_name, z_mock=z_mock)
     else:
         output_root = sim_params.get("subsample_dir", prepare_params.get("output_root"))
         if output_root is None:
-            raise KeyError("Set prepare_profiles.output_dir or sim_params.subsample_dir.")
-        output_dir = Path(output_root) / sim_name / z_directory(z_mock)
+            raise KeyError(
+                "Set prepare_profiles.output_dir, paths.prepared_dir, "
+                "or sim_params.subsample_dir."
+            )
+        output_path = Path(output_root) / sim_name / z_directory(z_mock)
 
     requested_slabs = slab_indices
     if requested_slabs is None and "slab_indices" in prepare_params:
         requested_slabs = [int(index) for index in prepare_params["slab_indices"]]
 
-    position_space = prepare_params.get("position_space")
-    if position_space is None:
-        position_space = "both" if prepare_params.get("write_rsd", False) else "real"
+    position_space_config = prepare_params.get("position_space")
+    if position_space_config is None:
+        position_space_config = "both" if prepare_params.get("write_rsd", False) else "real"
 
     return prepare_all_slabs(
         sim_dir=sim_dir,
         sim_name=sim_name,
         z_mock=z_mock,
-        output_dir=output_dir,
+        output_dir=output_path,
         slab_indices=requested_slabs,
-        n_parallel=int(prepare_params.get("Nparallel_load", prepare_params.get("n_parallel", 1))),
-        seed=int(seed if seed is not None else prepare_params.get("seed", 600)),
+        n_parallel=int(
+            _first_not_none(
+                n_parallel,
+                prepare_params.get("Nparallel_load"),
+                prepare_params.get("n_parallel"),
+                1,
+            )
+        ),
+        seed=int(_first_not_none(seed, prepare_params.get("seed"), 600)),
         cleaned_halos=bool(sim_params.get("cleaned_halos", True)),
-        overwrite=bool(overwrite if overwrite is not None else prepare_params.get("overwrite", False)),
-        position_space=str(position_space),
-        los_axis=prepare_params.get("los_axis", 2),
-        box_origin=str(prepare_params.get("box_origin", "center")),
-        nfw_count_factor=prepare_params.get("nfw_count_factor"),
-        min_particles_per_halo=int(prepare_params.get("min_particles_per_halo", 1)),
-        max_particles_per_halo=prepare_params.get("max_particles_per_halo"),
+        overwrite=bool(_first_not_none(overwrite, prepare_params.get("overwrite"), False)),
+        position_space=str(_first_not_none(position_space, position_space_config)),
+        los_axis=_first_not_none(los_axis, prepare_params.get("los_axis"), 2),
+        box_origin=str(_first_not_none(box_origin, prepare_params.get("box_origin"), "center")),
+        nfw_count_factor=_first_not_none(nfw_count_factor, prepare_params.get("nfw_count_factor")),
+        min_particles_per_halo=int(
+            _first_not_none(
+                min_particles_per_halo,
+                prepare_params.get("min_particles_per_halo"),
+                1,
+            )
+        ),
+        max_particles_per_halo=_first_not_none(
+            max_particles_per_halo,
+            prepare_params.get("max_particles_per_halo"),
+        ),
         satellite_velocity_model=str(
-            prepare_params.get("satellite_velocity_model", "gaussian")
+            _first_not_none(
+                satellite_velocity_model,
+                prepare_params.get("satellite_velocity_model"),
+                "gaussian",
+            )
         ),
         concentration_numerator_key=str(
-            concentration_numerator_key
-            if concentration_numerator_key is not None
-            else prepare_params.get("concentration_numerator_key", "r98_L2com")
+            _first_not_none(
+                concentration_numerator_key,
+                prepare_params.get("concentration_numerator_key"),
+                "r98_L2com",
+            )
         ),
         concentration_denominator_key=str(
-            concentration_denominator_key
-            if concentration_denominator_key is not None
-            else prepare_params.get("concentration_denominator_key", "r25_L2com")
+            _first_not_none(
+                concentration_denominator_key,
+                prepare_params.get("concentration_denominator_key"),
+                "r25_L2com",
+            )
         ),
         nfw_tolerance=float(prepare_params.get("nfw_tolerance", 1.0e-5)),
-        position_dtype=prepare_params.get("position_dtype", "f4"),
-        index_dtype=prepare_params.get("index_dtype", "i4"),
-        particle_chunk_size=int(prepare_params.get("particle_chunk_size", 2_000_000)),
-        write_particle_radius=bool(prepare_params.get("write_particle_radius", False)),
-        hdf5_compression=prepare_params.get("hdf5_compression"),
+        position_dtype=_first_not_none(position_dtype, prepare_params.get("position_dtype"), "f4"),
+        index_dtype=_first_not_none(index_dtype, prepare_params.get("index_dtype"), "i4"),
+        particle_chunk_size=int(
+            _first_not_none(
+                particle_chunk_size,
+                prepare_params.get("particle_chunk_size"),
+                2_000_000,
+            )
+        ),
+        write_particle_radius=bool(
+            _first_not_none(
+                write_particle_radius,
+                prepare_params.get("write_particle_radius"),
+                False,
+            )
+        ),
+        hdf5_compression=_first_not_none(
+            hdf5_compression,
+            prepare_params.get("hdf5_compression"),
+            prepare_params.get("compression"),
+        ),
         output_tag=str(prepare_params.get("output_tag", "abacustab_profiles")),
     )
