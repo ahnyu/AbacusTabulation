@@ -676,10 +676,9 @@ def prepare_from_config(
     optional ``prepare_profiles`` block for tabulation-specific options.
     """
 
-    import yaml
+    from .config import load_config
 
-    with open(path2config, "r", encoding="utf-8") as handle:
-        config = yaml.safe_load(handle)
+    config = load_config(path2config)
 
     sim_params = config.get("sim_params", {})
     paths_params = config.get("paths", {})

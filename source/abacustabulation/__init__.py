@@ -13,6 +13,8 @@ _EXPORTS = {
     "NumberDensityConstraint": (".fitting", "NumberDensityConstraint"),
     "ObservableDataSegment": (".fitting", "ObservableDataSegment"),
     "load_fitting_problem_from_config": (".fitting", "load_fitting_problem_from_config"),
+    "load_config": (".config", "load_config"),
+    "merge_configs": (".config", "merge_configs"),
     "HODClusteringTabulator": (".clustering", "HODClusteringTabulator"),
     "galaxy_correlation_from_config": (".clustering", "galaxy_correlation_from_config"),
     "galaxy_correlation_from_paircounts": (".clustering", "galaxy_correlation_from_paircounts"),

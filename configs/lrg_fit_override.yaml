@@ -1,0 +1,71 @@
+# Compact example that inherits all defaults from abacustabulation_base.yaml.
+# Run scripts with: --path2config configs/lrg_fit_override.yaml
+inherits: abacustabulation_base.yaml
+
+sim_params:
+  sim_dir: /cluster/path/to/AbacusSummit
+  sim_name: AbacusSummit_base_c000_ph000
+  z_mock: 0.800
+
+paths:
+  prepared_dir: /cluster/path/prepared/{sim_name}/{z}
+  paircounts_dir: /cluster/path/paircounts/{sim_name}/{z}
+
+paircounts:
+  file_tag: abacustab_profiles_conc-r98-L2com-over-r25-L2com
+  clustering: [rppi]
+  rppi:
+    nrp_bins: 25
+
+hod:
+  model: lrg
+  n_subbins: 20
+  params:
+    sigma: 0.4
+    logM1: 14.0
+    kappa: 1.0
+    alpha: 1.0
+    a_c: 1.0
+
+fit:
+  tracers: [LRG]
+  observables:
+    - tracer: LRG
+      statistic: wp
+      slice: [0, 20]
+
+  data:
+    tracers:
+      LRG:
+        wp:
+          path: /cluster/path/data/lrg_wp.txt
+          column: 1
+        number_density:
+          value: 3.5e-4
+          mode: minimum
+
+  covariance:
+    mode: joint
+    joint:
+      path: /cluster/path/data/lrg_wp_cov.txt
+
+  theory:
+    tracers:
+      LRG:
+        hod_model: lrg
+        n_subbins: 20
+        paircounts:
+          rppi:
+            path: null
+
+  parameters:
+    logMcut: {initial: 13.0, min: 12.0, max: 14.5}
+    sigma:   {initial: 0.4,  min: 0.05, max: 1.5}
+    logM1:   {initial: 14.0, min: 12.5, max: 15.5}
+    kappa:   {initial: 1.0,  min: 0.1,  max: 3.0}
+    alpha:   {initial: 1.0,  min: 0.2,  max: 2.0}
+    a_c:     {initial: 1.0,  min: 0.0,  max: 1.5}
+
+  output:
+    output_dir: /cluster/path/fit_outputs/{sim_name}/{z}
+    prefix: lrg_wp

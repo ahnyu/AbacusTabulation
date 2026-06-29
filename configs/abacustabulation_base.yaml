@@ -1,0 +1,204 @@
+# Universal AbacusTabulation config.
+# Both scripts accept this file through --path2config.
+
+sim_params:
+  sim_dir: /path/to/AbacusSummit
+  sim_name: AbacusSummit_base_c000_ph000
+  z_mock: 0.800
+  cleaned_halos: true
+
+# Shared paths may use {sim_name}, {z}, and {z_mock} format fields.
+# {z} is formatted like z0.800.
+paths:
+  prepared_dir: &prepared_dir /path/to/prepared/{sim_name}/{z}
+  paircounts_dir: &paircounts_dir /path/to/paircounts/{sim_name}/{z}
+
+prepare_profiles:
+  output_dir: *prepared_dir
+  seed: 600
+  overwrite: false
+  n_parallel: 1
+  slab_indices: null   # null means discover all halo_info slabs; or use [0, 1, 2]
+
+  # Positions written by the preparation step:
+  # real: pos is real-space only
+  # rsd:  pos is redshift-space only
+  # both: pos is real-space and pos_rsd is redshift-space
+  position_space: real
+  los_axis: z
+  box_origin: center
+
+  # NFW sample count rule: int(nfw_count_factor * N^2 + 1.5), then clipped.
+  # null uses the built-in default: 2e-7, with the HugeBase scaling when relevant.
+  nfw_count_factor: null
+  min_particles_per_halo: 1
+  max_particles_per_halo: null
+  particle_chunk_size: 2000000
+
+  # Satellite velocities only matter when position_space is rsd or both.
+  satellite_velocity_model: gaussian
+
+  # NFW profile concentration = numerator_key / denominator_key.
+  # The NFW truncation radius remains r98_L2com.
+  concentration_numerator_key: r98_L2com
+  concentration_denominator_key: r25_L2com
+  nfw_tolerance: 1.0e-5
+
+  position_dtype: f4
+  index_dtype: i4
+  write_particle_radius: false
+  hdf5_compression: null
+  output_tag: abacustab_profiles
+
+paircounts:
+  prepared_dir: *prepared_dir
+  output_dir: *paircounts_dir
+  overwrite: false
+
+  # If null, the paircount loader infers the prepared file tag when only one tag
+  # exists in prepared_dir. Set this when multiple concentration/profile runs share
+  # the same directory.
+  file_tag: null
+  seed: 600
+
+  # Use pos for real-space prepared files or RSD-only prepared files.
+  # Use pos_rsd only if prepare_profiles.position_space is both.
+  position_dataset: pos
+  clustering: [rppi]   # [rppi], [smu], or [rppi, smu]
+  nthreads: 32
+  boxsize: null        # null reads Lbox from prepared-file attrs
+  corrfunc_dtype: f4
+  hdf5_compression: null
+
+  mass:
+    nmass_bins: 20
+    logm_min: null
+    logm_max: null
+    # Either null, a list of edges, or a path to a text file of log10 mass edges.
+    logm_edges: null
+
+  rppi:
+    nrp_bins: 25
+    rp_min: -1.5       # log10 rp lower edge
+    rp_max: 1.477      # log10 rp upper edge
+    pi_max: 40.0       # Corrfunc DDrppi returns unit-width pi bins up to pi_max
+
+  smu:
+    ns_bins: 25
+    s_min: -1.5        # log10 s lower edge
+    s_max: 1.477       # log10 s upper edge
+    mu_max: 1.0
+    nmu_bins: 120
+
+# Example HOD block for Python-side clustering calls.
+# abacustabulation.galaxy_correlation_from_config(...) reads this block.
+# HOD parameter names are canonical-only; aliases such as logM_cut or pmax are rejected.
+hod:
+  model: lrg
+  n_subbins: 20
+  params:
+    logMcut: 13.0
+    sigma: 0.4
+    logM1: 14.0
+    kappa: 1.0
+    alpha: 1.0
+    a_c: 1.0
+
+
+# Optional fitting block for MCMC/optimization scripts.
+# scripts/run_fit_optimize.py and scripts/run_fit_pocomc.py read this block.
+fit:
+  # Multi-tracer syntax is explicit, but current production path is single-tracer auto fitting.
+  tracers: [LRG]
+
+  # Order here defines the theory vector order and the joint covariance order.
+  # Supported statistics are wp, xi0, and xi2.
+  observables:
+    - tracer: LRG
+      statistic: wp
+      slice: [0, 20]    # must not exceed paircounts.rppi.nrp_bins
+    - tracer: LRG
+      statistic: xi0
+      slice: [0, 25]    # must not exceed paircounts.smu.ns_bins
+    - tracer: LRG
+      statistic: xi2
+      slice: [0, 25]
+
+  data:
+    tracers:
+      LRG:
+        wp:
+          path: /path/to/wp.txt
+          column: 1
+
+        # xi0 and xi2 are read from the same xi02 file when either statistic is requested.
+        xi02:
+          path: /path/to/xi02.txt
+          xi0_column: 1
+          xi2_column: 3
+
+        # Number density is handled outside the clustering covariance.
+        # mode: minimum rejects models below value.
+        # mode: gaussian applies a one-sided Gaussian penalty below value.
+        number_density:
+          value: 3.5e-4
+          mode: minimum
+          error: null
+
+  covariance:
+    mode: joint          # joint or block
+    inversion: inv       # inv or pinv
+    covariance_n_mocks: null
+    precision_scale: 1.0
+
+    # Used when mode: joint. Block order must match fit.observables exactly.
+    joint:
+      path: /path/to/joint_covariance.txt
+
+    # Used when mode: block. Each block may be selected-size or full-size before slices.
+    blocks:
+      - observables: [wp]
+        path: /path/to/wp_covariance.txt
+      - observables: [xi0, xi2]
+        path: /path/to/xi02_covariance.txt
+
+  theory:
+    tracers:
+      LRG:
+        hod_model: lrg
+        n_subbins: 20
+        fixed_params: {}
+        paircounts:
+          rppi:
+            path: null   # null means infer from paircounts.output_dir/file_tag
+          smu:
+            path: null
+
+  # Ordered free parameters with uniform top-hat priors.
+  # Any HOD parameter not listed here is taken from hod.params and theory.tracers.<tracer>.fixed_params.
+  parameters:
+    logMcut: {initial: 13.0, min: 12.0, max: 14.5}
+    sigma:   {initial: 0.4,  min: 0.05, max: 1.5}
+    logM1:   {initial: 14.0, min: 12.5, max: 15.5}
+    kappa:   {initial: 1.0,  min: 0.1,  max: 3.0}
+    alpha:   {initial: 1.0,  min: 0.2,  max: 2.0}
+    a_c:     {initial: 1.0,  min: 0.0,  max: 1.5}
+
+  output:
+    output_dir: /path/to/fit_outputs/{sim_name}/{z}
+    prefix: lrg_tabulated
+
+  optimization:
+    method: Nelder-Mead        # or L-BFGS-B, Powell, differential_evolution
+    target: posterior          # posterior includes bounds; like maximizes likelihood only
+    options:
+      maxiter: 1000
+
+  mcmc:
+    pocomc:
+      use_mpi: false
+      resume_state_path: null
+      sampler: {}
+      run:
+        n_total: 4096
+        save_every: 5

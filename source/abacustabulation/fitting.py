@@ -189,10 +189,9 @@ class HODFittingProblem:
 
     @classmethod
     def from_config(cls, path2config: str | Path, *, validate: bool = True) -> "HODFittingProblem":
-        import yaml
+        from .config import load_config
 
-        with open(path2config, "r", encoding="utf-8") as handle:
-            config = yaml.safe_load(handle)
+        config = load_config(path2config)
         fit_config = config.get("fit")
         if fit_config is None:
             raise KeyError("Set a fit: block in the universal config.")

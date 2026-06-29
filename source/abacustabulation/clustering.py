@@ -501,10 +501,9 @@ def galaxy_correlation_from_config(
 ) -> GalaxyClusteringResult:
     """Read the universal YAML config and return HOD-weighted galaxy clustering."""
 
-    import yaml
+    from .config import load_config
 
-    with open(path2config, "r", encoding="utf-8") as handle:
-        config = yaml.safe_load(handle)
+    config = load_config(path2config)
 
     sim_params = config.get("sim_params", {})
     paths_params = config.get("paths", {})
