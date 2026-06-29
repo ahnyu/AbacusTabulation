@@ -7,16 +7,17 @@ from pathlib import Path
 from typing import Any
 
 
-_INHERIT_KEYS = ("inherits", "inherit", "base")
+_INHERIT_KEYS = ("inherits", "inherit")
+_PREFERRED_INHERIT_KEY = "inherits"
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
     """Load a YAML config, resolving optional base-config inheritance.
 
-    A config may contain one of ``inherits``, ``inherit``, or ``base`` with a
-    path or list of paths. Base paths are resolved relative to the child config
-    file. Merge rules are intentionally simple: dictionaries merge recursively,
-    while lists, scalars, and explicit ``null`` values replace the base value.
+    A config may contain ``inherits`` with a path or list of paths. Base paths
+    are resolved relative to the child config file. Merge rules are
+    intentionally simple: dictionaries merge recursively, while lists, scalars,
+    and explicit ``null`` values replace the base value.
     """
 
     return _load_config(Path(path), stack=())
@@ -58,13 +59,14 @@ def _load_config(path: Path, *, stack: tuple[Path, ...]) -> dict[str, Any]:
 
 
 def _inherit_paths(data: Mapping[str, Any], base_dir: Path) -> tuple[Path, ...]:
-    value = None
     found = [key for key in _INHERIT_KEYS if key in data]
     if not found:
+        _validate_legacy_base_key(data)
         return ()
     if len(found) > 1:
         raise ValueError(f"Use only one config inheritance key, not {found}.")
     value = data[found[0]]
+    _validate_legacy_base_key(data)
     if value is None:
         return ()
     values = value if isinstance(value, list) else [value]
@@ -75,3 +77,15 @@ def _inherit_paths(data: Mapping[str, Any], base_dir: Path) -> tuple[Path, ...]:
             parent = base_dir / parent
         paths.append(parent)
     return tuple(paths)
+
+
+def _validate_legacy_base_key(data: Mapping[str, Any]) -> None:
+    if "base" not in data:
+        return
+    value = data["base"]
+    if isinstance(value, Mapping) or value is None:
+        return
+    raise ValueError(
+        f"Top-level 'base' is no longer an inheritance key; use "
+        f"'{_PREFERRED_INHERIT_KEY}' instead."
+    )

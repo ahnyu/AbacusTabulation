@@ -24,6 +24,7 @@ class FitParameter:
     initial: float
     minimum: float
     maximum: float
+    shared: bool = False
 
     def contains(self, value: float) -> bool:
         return self.minimum <= float(value) <= self.maximum
@@ -94,6 +95,14 @@ class NumberDensityConstraint:
             diff = theory_density - self.value
             return float(-0.5 * diff * diff / (self.error * self.error))
         raise ValueError(f"Unknown number-density mode {self.mode!r} for tracer {self.tracer!r}.")
+
+
+@dataclass
+class _TheoryEvaluation:
+    """Cached theory pieces for one HOD parameter vector."""
+
+    theory_vector: np.ndarray
+    number_densities: Mapping[str, float]
 
 
 @dataclass
@@ -186,6 +195,7 @@ class HODFittingProblem:
         self.parameter_names = tuple(param.name for param in self.parameters)
         if len(set(self.parameter_names)) != len(self.parameter_names):
             raise ValueError(f"Duplicate fit parameter names: {self.parameter_names}")
+        _validate_parameter_ownership(self.parameters, self.tracers)
 
     @classmethod
     def from_config(cls, path2config: str | Path, *, validate: bool = True) -> "HODFittingProblem":
@@ -236,11 +246,13 @@ class HODFittingProblem:
             tracers=tracers,
         )
         if validate:
-            theory = problem.theory_vector(problem.initial_vector())
-            if theory.size != data.size:
+            evaluation = problem._evaluate(problem.initial_vector())
+            if evaluation.theory_vector.size != data.size:
                 raise ValueError(
-                    f"Initial theory vector has length {theory.size}; data vector has length {data.size}."
+                    f"Initial theory vector has length {evaluation.theory_vector.size}; "
+                    f"data vector has length {data.size}."
                 )
+            problem._density_loglike_from_densities(evaluation.number_densities)
         return problem
 
     def format_path(self, value: str | Path) -> Path:
@@ -259,12 +271,13 @@ class HODFittingProblem:
     def params_for_tracer(self, theta: ArrayLike, tracer: str) -> dict[str, Any]:
         theta = self._theta(theta)
         params = dict(self.fixed_params_by_tracer.get(tracer, {}))
+        multi_tracer = len(self.tracers) > 1
         for param, value in zip(self.parameters, theta, strict=True):
             if "." in param.name:
                 param_tracer, param_name = param.name.split(".", 1)
                 if param_tracer == tracer:
                     params[param_name] = float(value)
-            else:
+            elif not multi_tracer or param.shared:
                 params[param.name] = float(value)
         return params
 
@@ -276,52 +289,21 @@ class HODFittingProblem:
         return 0.0
 
     def theory_vector(self, theta: ArrayLike) -> np.ndarray:
-        theta = self._theta(theta)
-        segments = []
-        result_cache: dict[tuple[str, Path, int, str], Any] = {}
-        for spec in self.observables:
-            cache_key = (spec.tracer, spec.paircount_path, spec.n_subbins, spec.hod_model)
-            if cache_key not in result_cache:
-                tabulator = self._tabulator_for_spec(spec)
-                result_cache[cache_key] = tabulator.correlation(
-                    self.params_for_tracer(theta, spec.tracer),
-                    hod_model=spec.hod_model,
-                )
-            segments.append(_extract_observable(result_cache[cache_key], spec))
-        return np.concatenate(segments) if segments else np.array([], dtype=np.float64)
+        return self._evaluate(theta).theory_vector
 
     def theory_number_density(self, theta: ArrayLike, tracer: str) -> float:
-        theta = self._theta(theta)
-        for spec in self.observables:
-            if spec.tracer == tracer:
-                result = self._tabulator_for_spec(spec).correlation(
-                    self.params_for_tracer(theta, tracer),
-                    hod_model=spec.hod_model,
-                )
-                return float(result.number_density)
-        raise KeyError(f"No observable is configured for tracer {tracer!r}; cannot compute number density.")
+        densities = self._evaluate(theta).number_densities
+        if tracer not in densities:
+            raise KeyError(f"No observable is configured for tracer {tracer!r}; cannot compute number density.")
+        return float(densities[tracer])
 
     def density_loglike(self, theta: ArrayLike) -> float:
-        theta = self._theta(theta)
-        total = 0.0
-        densities: dict[str, float] = {}
-        for constraint in self.density_constraints:
-            if constraint.tracer not in densities:
-                densities[constraint.tracer] = self.theory_number_density(theta, constraint.tracer)
-            term = constraint.loglike(densities[constraint.tracer])
-            if not np.isfinite(term):
-                return -np.inf
-            total += term
-        return float(total)
+        return self._density_loglike_from_densities(self._evaluate(theta).number_densities)
 
     def loglike(self, theta: ArrayLike) -> float:
-        theta = self._theta(theta)
-        try:
-            theory = self.theory_vector(theta)
-            clustering_value = self.data.loglike(theory)
-            density_value = self.density_loglike(theta)
-        except Exception:
-            return -np.inf
+        evaluation = self._evaluate(theta)
+        clustering_value = self.data.loglike(evaluation.theory_vector)
+        density_value = self._density_loglike_from_densities(evaluation.number_densities)
         value = clustering_value + density_value
         return float(value) if np.isfinite(value) else -np.inf
 
@@ -357,6 +339,39 @@ class HODFittingProblem:
         import pocomc as pc
 
         return pc.Prior(self.scipy_prior_distributions())
+
+    def _evaluate(self, theta: ArrayLike) -> _TheoryEvaluation:
+        theta = self._theta(theta)
+        segments = []
+        densities: dict[str, float] = {}
+        result_cache: dict[tuple[str, Path, int, str], Any] = {}
+        for spec in self.observables:
+            cache_key = (spec.tracer, spec.paircount_path, spec.n_subbins, spec.hod_model)
+            if cache_key not in result_cache:
+                tabulator = self._tabulator_for_spec(spec)
+                result_cache[cache_key] = tabulator.correlation(
+                    self.params_for_tracer(theta, spec.tracer),
+                    hod_model=spec.hod_model,
+                )
+            result = result_cache[cache_key]
+            densities.setdefault(spec.tracer, float(result.number_density))
+            segments.append(_extract_observable(result, spec))
+        theory = np.concatenate(segments) if segments else np.array([], dtype=np.float64)
+        return _TheoryEvaluation(theory_vector=theory, number_densities=densities)
+
+    def _density_loglike_from_densities(self, densities: Mapping[str, float]) -> float:
+        total = 0.0
+        for constraint in self.density_constraints:
+            if constraint.tracer not in densities:
+                raise KeyError(
+                    f"No observable is configured for tracer {constraint.tracer!r}; "
+                    f"cannot compute number density."
+                )
+            term = constraint.loglike(float(densities[constraint.tracer]))
+            if not np.isfinite(term):
+                return -np.inf
+            total += term
+        return float(total)
 
     def _theta(self, theta: ArrayLike) -> np.ndarray:
         theta = np.asarray(theta, dtype=np.float64).reshape(-1)
@@ -687,6 +702,38 @@ def _infer_tracers(observables: Sequence[ObservableSpec]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(spec.tracer for spec in observables))
 
 
+def _validate_parameter_ownership(parameters: Sequence[FitParameter], tracers: Sequence[str]) -> None:
+    tracer_set = set(tracers)
+    invalid_shared = []
+    unknown_tracers = []
+    malformed = []
+    for param in parameters:
+        if "." in param.name:
+            param_tracer, param_name = param.name.split(".", 1)
+            if not param_tracer or not param_name:
+                malformed.append(param.name)
+            elif param_tracer not in tracer_set:
+                unknown_tracers.append(param.name)
+            if param.shared:
+                invalid_shared.append(param.name)
+    if malformed:
+        raise ValueError(f"Malformed tracer-qualified fit parameter names: {malformed}.")
+    if unknown_tracers:
+        raise ValueError(
+            f"Fit parameters reference unknown tracers {unknown_tracers}; configured tracers are {tuple(tracers)}."
+        )
+    if invalid_shared:
+        raise ValueError(f"Tracer-qualified parameters cannot also set shared: true: {invalid_shared}.")
+    if len(tracers) <= 1:
+        return
+    unqualified = [param.name for param in parameters if "." not in param.name and not param.shared]
+    if unqualified:
+        raise ValueError(
+            f"Multi-tracer fits require tracer-qualified parameters or shared: true. "
+            f"Unqualified non-shared parameters: {unqualified}."
+        )
+
+
 def _resolve_paircount_path(config: Mapping[str, Any], path_config: Mapping[str, Any], *, clustering: str) -> Path:
     paths_params = config.get("paths", {})
     pair_params = config.get("paircounts", {})
@@ -719,10 +766,12 @@ def _parse_parameters(config: Mapping[str, Any] | Sequence[Mapping[str, Any]]) -
             items.append((item["name"], item))
 
     for name, spec in items:
+        shared = False
         if isinstance(spec, Mapping):
             minimum = float(_required(spec, "min"))
             maximum = float(_required(spec, "max"))
             initial = float(spec.get("initial", 0.5 * (minimum + maximum)))
+            shared = bool(spec.get("shared", False))
         else:
             values = list(spec)
             if len(values) == 2:
@@ -736,7 +785,7 @@ def _parse_parameters(config: Mapping[str, Any] | Sequence[Mapping[str, Any]]) -
             raise ValueError(f"Parameter {name!r} has invalid bounds [{minimum}, {maximum}].")
         if not minimum <= initial <= maximum:
             raise ValueError(f"Initial value for {name!r} lies outside its prior bounds.")
-        parameters.append(FitParameter(str(name), initial, minimum, maximum))
+        parameters.append(FitParameter(str(name), initial, minimum, maximum, shared=shared))
     return tuple(parameters)
 
 

@@ -176,6 +176,7 @@ fit:
 
   # Ordered free parameters with uniform top-hat priors.
   # Any HOD parameter not listed here is taken from hod.params and theory.tracers.<tracer>.fixed_params.
+  # Multi-tracer fits require TRACER.param names unless the parameter sets shared: true.
   parameters:
     logMcut: {initial: 13.0, min: 12.0, max: 14.5}
     sigma:   {initial: 0.4,  min: 0.05, max: 1.5}
