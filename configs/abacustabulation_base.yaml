@@ -8,9 +8,8 @@ sim_params:
   cleaned_halos: true
 
 prepare_profiles:
-  # Paths may use {sim_name}, {z}, and {z_mock} format fields.
-  # {z} is formatted like z0.800.
-  output_dir: /path/to/prepared/{sim_name}/{z}
+  # Plain roots expand to <root>/{sim_name}/{z}. Explicit templates still work.
+  out_dir: /path/to/prepared
   seed: 600
   overwrite: false
   n_parallel: 1
@@ -47,8 +46,9 @@ prepare_profiles:
   output_tag: abacustab_profiles
 
 paircounts:
-  prepared_dir: /path/to/prepared/{sim_name}/{z}
-  output_dir: /path/to/paircounts/{sim_name}/{z}
+  # Plain roots expand to <root>/{sim_name}/{z}. Explicit templates still work.
+  prepared_dir: /path/to/prepared
+  output_dir: /path/to/paircounts
   overwrite: false
 
   # If null, the paircount loader infers the prepared file tag when only one tag

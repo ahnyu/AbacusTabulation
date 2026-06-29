@@ -741,7 +741,7 @@ def _resolve_paircount_path(config: Mapping[str, Any], path_config: Mapping[str,
     output_value = path_config.get("dir", path_config.get("paircounts_dir", pair_params.get("output_dir", paths_params.get("paircounts_dir"))))
     if output_value is None:
         raise KeyError("Set paircounts.output_dir, paths.paircounts_dir, or theory.tracers.<tracer>.paircounts.<mode>.dir.")
-    output_dir = _format_config_path(output_value, config)
+    output_dir = _format_sim_output_dir(output_value, config)
     position_dataset = str(path_config.get("position_dataset", pair_params.get("position_dataset", "pos")))
     file_tag = path_config.get("file_tag", pair_params.get("file_tag"))
     nmass_bins = int(path_config.get("nmass_bins", mass_params.get("nmass_bins", pair_params.get("nmass_bins", 20))))
@@ -896,6 +896,23 @@ def _format_config_path(value: str | Path, config: Mapping[str, Any]) -> Path:
             z_mock=float(sim_params.get("z_mock", 0.0)),
         )
     )
+
+
+def _has_sim_format_fields(value: str) -> bool:
+    return any(field in value for field in ("{sim_name", "{z", "{z_mock"))
+
+
+def _format_sim_output_dir(value: str | Path, config: Mapping[str, Any]) -> Path:
+    sim_params = config.get("sim_params", {})
+    sim_name = str(sim_params.get("sim_name", ""))
+    z_mock = float(sim_params.get("z_mock", 0.0))
+    z_dir = _z_directory(z_mock)
+    template = str(value)
+    has_fields = _has_sim_format_fields(template)
+    path = Path(template.format(sim_name=sim_name, z=z_dir, z_mock=z_mock))
+    if has_fields or tuple(path.parts[-2:]) == (sim_name, z_dir):
+        return path
+    return path / sim_name / z_dir
 
 
 def _sanitize_filename_piece(value: object) -> str:

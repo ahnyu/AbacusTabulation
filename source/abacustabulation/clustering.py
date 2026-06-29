@@ -445,14 +445,24 @@ def _z_directory(z_mock: float) -> str:
     return f"z{float(z_mock):.3f}"
 
 
+def _has_sim_format_fields(value: str) -> bool:
+    return any(field in value for field in ("{sim_name", "{z", "{z_mock"))
+
+
 def _format_config_path(value: str | Path, *, sim_name: str, z_mock: float) -> Path:
-    return Path(
-        str(value).format(
+    template = str(value)
+    z_dir = _z_directory(z_mock)
+    has_fields = _has_sim_format_fields(template)
+    path = Path(
+        template.format(
             sim_name=sim_name,
-            z=_z_directory(z_mock),
+            z=z_dir,
             z_mock=float(z_mock),
         )
     )
+    if has_fields or tuple(path.parts[-2:]) == (sim_name, z_dir):
+        return path
+    return path / sim_name / z_dir
 
 
 def _sanitize_filename_piece(value: object) -> str:

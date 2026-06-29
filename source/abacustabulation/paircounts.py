@@ -938,14 +938,24 @@ def _z_directory(z_mock: float) -> str:
     return f"z{float(z_mock):.3f}"
 
 
+def _has_sim_format_fields(value: str) -> bool:
+    return any(field in value for field in ("{sim_name", "{z", "{z_mock"))
+
+
 def _format_config_path(value: str | Path, *, sim_name: str, z_mock: float) -> Path:
-    return Path(
-        str(value).format(
+    template = str(value)
+    z_dir = _z_directory(z_mock)
+    has_fields = _has_sim_format_fields(template)
+    path = Path(
+        template.format(
             sim_name=sim_name,
-            z=_z_directory(z_mock),
+            z=z_dir,
             z_mock=float(z_mock),
         )
     )
+    if has_fields or tuple(path.parts[-2:]) == (sim_name, z_dir):
+        return path
+    return path / sim_name / z_dir
 
 
 def normalize_clustering_modes(value: object | None) -> list[str]:
@@ -1116,6 +1126,7 @@ def paircounts_from_config(
         prepared_dir,
         pair_params.get("prepared_dir"),
         paths_params.get("prepared_dir"),
+        prepare_params.get("out_dir"),
         prepare_params.get("output_dir"),
     )
     if prepared_value is None:
@@ -1123,7 +1134,7 @@ def paircounts_from_config(
         if output_root is None:
             raise KeyError(
                 "Set paircounts.prepared_dir, paths.prepared_dir, "
-                "prepare_profiles.output_dir, or sim_params.subsample_dir."
+                "prepare_profiles.out_dir, prepare_profiles.output_dir, or sim_params.subsample_dir."
             )
         prepared_path = Path(output_root) / sim_name / _z_directory(z_mock)
     else:

@@ -8,11 +8,11 @@ sim_params:
   z_mock: 0.800
 
 prepare_profiles:
-  output_dir: /cluster/path/prepared/{sim_name}/{z}
+  out_dir: /cluster/path/prepared
 
 paircounts:
-  prepared_dir: /cluster/path/prepared/{sim_name}/{z}
-  output_dir: /cluster/path/paircounts/{sim_name}/{z}
+  prepared_dir: /cluster/path/prepared
+  output_dir: /cluster/path/paircounts
   file_tag: abacustab_profiles_conc-r98-L2com-over-r25-L2com
   clustering: [rppi]
 

@@ -641,8 +641,17 @@ def _first_not_none(*values: Any) -> Any:
     return None
 
 
+def _has_sim_format_fields(value: str) -> bool:
+    return any(field in value for field in ("{sim_name", "{z", "{z_mock"))
+
+
 def _format_output_dir(template: str, *, sim_name: str, z_mock: float) -> Path:
-    return Path(template.format(sim_name=sim_name, z=z_directory(z_mock), z_mock=z_mock))
+    z_dir = z_directory(z_mock)
+    has_fields = _has_sim_format_fields(template)
+    path = Path(template.format(sim_name=sim_name, z=z_dir, z_mock=z_mock))
+    if has_fields or tuple(path.parts[-2:]) == (sim_name, z_dir):
+        return path
+    return path / sim_name / z_dir
 
 
 def prepare_from_config(
@@ -690,6 +699,7 @@ def prepare_from_config(
 
     output_value = _first_not_none(
         output_dir,
+        prepare_params.get("out_dir"),
         prepare_params.get("output_dir"),
         paths_params.get("prepared_dir"),
     )
@@ -699,7 +709,7 @@ def prepare_from_config(
         output_root = sim_params.get("subsample_dir", prepare_params.get("output_root"))
         if output_root is None:
             raise KeyError(
-                "Set prepare_profiles.output_dir, paths.prepared_dir, "
+                "Set prepare_profiles.out_dir, prepare_profiles.output_dir, paths.prepared_dir, "
                 "or sim_params.subsample_dir."
             )
         output_path = Path(output_root) / sim_name / z_directory(z_mock)

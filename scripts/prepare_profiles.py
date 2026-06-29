@@ -38,8 +38,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-dir",
         help=(
-            "Directory for prepared files. Without --path2config this is used directly; "
-            "with config prefer prepare_profiles.output_dir."
+            "Prepared-file root directory. Without --path2config this is combined with "
+            "sim-name/z; with config prefer prepare_profiles.out_dir."
         ),
     )
     parser.add_argument("--slabs", nargs="*", help="Slab indices, e.g. --slabs 0 1 2 or 0,1,2.")
