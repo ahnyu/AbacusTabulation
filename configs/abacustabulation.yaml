@@ -103,3 +103,102 @@ hod:
     kappa: 1.0
     alpha: 1.0
     a_c: 1.0
+
+
+# Optional fitting block for MCMC/optimization scripts.
+# scripts/run_fit_optimize.py and scripts/run_fit_pocomc.py read this block.
+fit:
+  # Multi-tracer syntax is explicit, but current production path is single-tracer auto fitting.
+  tracers: [LRG]
+
+  # Order here defines the theory vector order and the joint covariance order.
+  # Supported statistics are wp, xi0, and xi2.
+  observables:
+    - tracer: LRG
+      statistic: wp
+      slice: [0, 20]    # must not exceed paircounts.rppi.nrp_bins
+    - tracer: LRG
+      statistic: xi0
+      slice: [0, 25]    # must not exceed paircounts.smu.ns_bins
+    - tracer: LRG
+      statistic: xi2
+      slice: [0, 25]
+
+  data:
+    tracers:
+      LRG:
+        wp:
+          path: /path/to/wp.txt
+          column: 1
+
+        # xi0 and xi2 are read from the same xi02 file when either statistic is requested.
+        xi02:
+          path: /path/to/xi02.txt
+          xi0_column: 1
+          xi2_column: 3
+
+        # Number density is handled outside the clustering covariance.
+        # mode: minimum rejects models below value.
+        # mode: gaussian applies a one-sided Gaussian penalty below value.
+        number_density:
+          value: 3.5e-4
+          mode: minimum
+          error: null
+
+  covariance:
+    mode: joint          # joint or block
+    inversion: inv       # inv or pinv
+    covariance_n_mocks: null
+    precision_scale: 1.0
+
+    # Used when mode: joint. Block order must match fit.observables exactly.
+    joint:
+      path: /path/to/joint_covariance.txt
+
+    # Used when mode: block. Each block may be selected-size or full-size before slices.
+    blocks:
+      - observables: [wp]
+        path: /path/to/wp_covariance.txt
+      - observables: [xi0, xi2]
+        path: /path/to/xi02_covariance.txt
+
+  theory:
+    tracers:
+      LRG:
+        hod_model: lrg
+        n_subbins: 20
+        fixed_params: {}
+        paircounts:
+          rppi:
+            path: null   # null means infer from paircounts.output_dir/file_tag
+          smu:
+            path: null
+
+  # Ordered free parameters with uniform top-hat priors.
+  # Any HOD parameter not listed here is taken from hod.params and theory.tracers.<tracer>.fixed_params.
+  parameters:
+    logMcut: {initial: 13.0, min: 12.0, max: 14.5}
+    sigma:   {initial: 0.4,  min: 0.05, max: 1.5}
+    logM1:   {initial: 14.0, min: 12.5, max: 15.5}
+    kappa:   {initial: 1.0,  min: 0.1,  max: 3.0}
+    alpha:   {initial: 1.0,  min: 0.2,  max: 2.0}
+    a_c:     {initial: 1.0,  min: 0.0,  max: 1.5}
+
+  output:
+    output_dir: /path/to/fit_outputs/{sim_name}/{z}
+    prefix: lrg_tabulated
+
+  optimization:
+    method: Nelder-Mead        # or L-BFGS-B, Powell, differential_evolution
+    target: posterior          # posterior includes bounds; like maximizes likelihood only
+    options:
+      maxiter: 1000
+
+  mcmc:
+    pocomc:
+      use_mpi: false
+      resume_state_path: null
+      sampler: {}
+      run:
+        n_total: 4096
+        save_every: 5
