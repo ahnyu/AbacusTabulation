@@ -7,15 +7,14 @@ sim_params:
   sim_name: AbacusSummit_base_c000_ph000
   z_mock: 0.800
 
-paths:
-  prepared_dir: /cluster/path/prepared/{sim_name}/{z}
-  paircounts_dir: /cluster/path/paircounts/{sim_name}/{z}
+prepare_profiles:
+  output_dir: /cluster/path/prepared/{sim_name}/{z}
 
 paircounts:
+  prepared_dir: /cluster/path/prepared/{sim_name}/{z}
+  output_dir: /cluster/path/paircounts/{sim_name}/{z}
   file_tag: abacustab_profiles_conc-r98-L2com-over-r25-L2com
   clustering: [rppi]
-  rppi:
-    nrp_bins: 25
 
 hod:
   model: lrg
@@ -32,7 +31,7 @@ fit:
   observables:
     - tracer: LRG
       statistic: wp
-      slice: [0, 20]
+      slice: [0, 18]
 
   data:
     tracers:

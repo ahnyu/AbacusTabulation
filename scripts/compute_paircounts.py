@@ -127,15 +127,15 @@ def main(argv: list[str] | None = None) -> int:
             logm_min=args.logm_min,
             logm_max=args.logm_max,
             logm_edges=args.logm_edges,
-            nrp_bins=args.nrp_bins if args.nrp_bins is not None else 25,
+            nrp_bins=args.nrp_bins if args.nrp_bins is not None else 18,
             rp_min=args.rp_min if args.rp_min is not None else -1.5,
-            rp_max=args.rp_max if args.rp_max is not None else 1.477,
+            rp_max=args.rp_max if args.rp_max is not None else 1.5,
             pi_max=args.pi_max if args.pi_max is not None else 40.0,
-            ns_bins=args.ns_bins if args.ns_bins is not None else 25,
+            ns_bins=args.ns_bins if args.ns_bins is not None else 18,
             s_min=args.s_min if args.s_min is not None else -1.5,
-            s_max=args.s_max if args.s_max is not None else 1.477,
+            s_max=args.s_max if args.s_max is not None else 1.5,
             mu_max=args.mu_max if args.mu_max is not None else 1.0,
-            nmu_bins=args.nmu_bins if args.nmu_bins is not None else 120,
+            nmu_bins=args.nmu_bins if args.nmu_bins is not None else 100,
         )
 
     for output in outputs:

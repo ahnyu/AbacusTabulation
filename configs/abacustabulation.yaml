@@ -7,14 +7,10 @@ sim_params:
   z_mock: 0.800
   cleaned_halos: true
 
-# Shared paths may use {sim_name}, {z}, and {z_mock} format fields.
-# {z} is formatted like z0.800.
-paths:
-  prepared_dir: &prepared_dir /path/to/prepared/{sim_name}/{z}
-  paircounts_dir: &paircounts_dir /path/to/paircounts/{sim_name}/{z}
-
 prepare_profiles:
-  output_dir: *prepared_dir
+  # Paths may use {sim_name}, {z}, and {z_mock} format fields.
+  # {z} is formatted like z0.800.
+  output_dir: /path/to/prepared/{sim_name}/{z}
   seed: 600
   overwrite: false
   n_parallel: 1
@@ -51,8 +47,8 @@ prepare_profiles:
   output_tag: abacustab_profiles
 
 paircounts:
-  prepared_dir: *prepared_dir
-  output_dir: *paircounts_dir
+  prepared_dir: /path/to/prepared/{sim_name}/{z}
+  output_dir: /path/to/paircounts/{sim_name}/{z}
   overwrite: false
 
   # If null, the paircount loader infers the prepared file tag when only one tag
@@ -78,17 +74,17 @@ paircounts:
     logm_edges: null
 
   rppi:
-    nrp_bins: 25
+    nrp_bins: 18
     rp_min: -1.5       # log10 rp lower edge
-    rp_max: 1.477      # log10 rp upper edge
+    rp_max: 1.5        # log10 rp upper edge
     pi_max: 40.0       # Corrfunc DDrppi returns unit-width pi bins up to pi_max
 
   smu:
-    ns_bins: 25
+    ns_bins: 18
     s_min: -1.5        # log10 s lower edge
-    s_max: 1.477       # log10 s upper edge
+    s_max: 1.5         # log10 s upper edge
     mu_max: 1.0
-    nmu_bins: 120
+    nmu_bins: 100
 
 # Example HOD block for Python-side clustering calls.
 # abacustabulation.galaxy_correlation_from_config(...) reads this block.
@@ -116,13 +112,13 @@ fit:
   observables:
     - tracer: LRG
       statistic: wp
-      slice: [0, 20]    # must not exceed paircounts.rppi.nrp_bins
+      slice: [0, 18]    # must not exceed paircounts.rppi.nrp_bins
     - tracer: LRG
       statistic: xi0
-      slice: [0, 25]    # must not exceed paircounts.smu.ns_bins
+      slice: [0, 18]    # must not exceed paircounts.smu.ns_bins
     - tracer: LRG
       statistic: xi2
-      slice: [0, 25]
+      slice: [0, 18]
 
   data:
     tracers:
