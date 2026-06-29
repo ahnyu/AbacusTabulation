@@ -134,11 +134,12 @@ fit:
           xi2_column: 3
 
         # Number density is handled outside the clustering covariance.
+        # mode: none disables this constraint.
         # mode: minimum rejects models below value.
         # mode: gaussian applies a one-sided Gaussian penalty below value.
         number_density:
-          value: 3.5e-4
-          mode: minimum
+          value: null
+          mode: none
           error: null
 
   covariance:
