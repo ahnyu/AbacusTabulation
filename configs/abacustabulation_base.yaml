@@ -63,6 +63,8 @@ paircounts:
 
   mass:
     nmass_bins: 20
+    # Halo-count subbins stored in paircount files for downstream HOD weighting.
+    n_subbins: 20
     logm_min: null
     logm_max: null
     # Either null, a list of edges, or a path to a text file of log10 mass edges.
@@ -148,7 +150,6 @@ derived:
   tracers:
     LRG:
       hod_model: lrg
-      n_subbins: 20
       hmf:
         path: null
 
@@ -157,7 +158,6 @@ derived:
 # HOD parameter names are canonical-only; aliases such as logM_cut or pmax are rejected.
 hod:
   model: lrg
-  n_subbins: 20
   params:
     logMcut: 13.0
     sigma: 0.4
@@ -231,7 +231,6 @@ fit:
     tracers:
       LRG:
         hod_model: lrg
-        n_subbins: 20
         fixed_params: {}
         paircounts:
           rppi:

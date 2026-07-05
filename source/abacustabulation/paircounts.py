@@ -14,6 +14,7 @@ import numpy as np
 PREPARED_HALO_RE = re.compile(
     r"halos_xcom_(?P<slab>\d+)_seed(?P<seed>\d+)_(?P<tag>.+)\.h5$"
 )
+PAIRCOUNT_SCHEMA_VERSION = "paircounts_v2"
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,9 @@ class MassTabulation:
     particle_bin: np.ndarray
     num_halo: np.ndarray
     num_particle: np.ndarray
+    halo_subbin_edges_log10: np.ndarray | None = None
+    halo_subbin_centers_log10: np.ndarray | None = None
+    num_halo_subbin: np.ndarray | None = None
 
 
 def _sanitize_filename_piece(value: object) -> str:
@@ -278,11 +282,18 @@ def parse_logm_edges(value: object | None) -> np.ndarray | None:
             edges = np.loadtxt(path, dtype=np.float64)
         else:
             edges = np.array([float(item) for item in value_str.split(",") if item.strip()])
-    if edges.ndim != 1 or len(edges) < 2:
+    return validate_logm_edges(edges)
+
+
+def validate_logm_edges(edges: object) -> np.ndarray:
+    """Return validated one-dimensional, strictly increasing log10 mass edges."""
+
+    out = np.asarray(edges, dtype=np.float64)
+    if out.ndim != 1 or len(out) < 2:
         raise ValueError("Mass-bin edges must be a one-dimensional array with >=2 edges.")
-    if np.any(np.diff(edges) <= 0.0):
+    if np.any(np.diff(out) <= 0.0):
         raise ValueError("Mass-bin edges must be strictly increasing.")
-    return edges
+    return out
 
 
 def _assign_log_bins(log_mass: np.ndarray, edges: np.ndarray) -> np.ndarray:
@@ -290,6 +301,41 @@ def _assign_log_bins(log_mass: np.ndarray, edges: np.ndarray) -> np.ndarray:
     bin_index[(log_mass < edges[0]) | (log_mass > edges[-1])] = -1
     bin_index[log_mass == edges[-1]] = len(edges) - 2
     return bin_index.astype(np.int32, copy=False)
+
+
+def _mass_subbin_edges_log10(edges: np.ndarray, n_subbins: int) -> np.ndarray:
+    edges = np.asarray(edges, dtype=np.float64)
+    n_subbins = int(n_subbins)
+    if n_subbins <= 0:
+        raise ValueError("mass_n_subbins must be positive.")
+    fraction = np.linspace(0.0, 1.0, n_subbins + 1, dtype=np.float64)
+    return edges[:-1, None] + np.diff(edges)[:, None] * fraction[None, :]
+
+
+def _mass_subbin_centers_log10(edges: np.ndarray, n_subbins: int) -> np.ndarray:
+    sub_edges = _mass_subbin_edges_log10(edges, n_subbins)
+    return 0.5 * (sub_edges[:, :-1] + sub_edges[:, 1:])
+
+
+def _halo_subbin_counts(log_mass: np.ndarray, halo_bin: np.ndarray, edges: np.ndarray, n_subbins: int) -> np.ndarray:
+    log_mass = np.asarray(log_mass, dtype=np.float64)
+    halo_bin = np.asarray(halo_bin, dtype=np.int64)
+    edges = np.asarray(edges, dtype=np.float64)
+    n_subbins = int(n_subbins)
+    if n_subbins <= 0:
+        raise ValueError("mass_n_subbins must be positive.")
+    nmass = len(edges) - 1
+    out = np.zeros((nmass, n_subbins), dtype=np.int64)
+    valid = halo_bin >= 0
+    if not np.any(valid):
+        return out
+    bins = halo_bin[valid]
+    widths = np.diff(edges)[bins]
+    fraction = (log_mass[valid] - edges[bins]) / widths
+    subbin = np.floor(fraction * n_subbins).astype(np.int64)
+    subbin = np.clip(subbin, 0, n_subbins - 1)
+    flat = bins * n_subbins + subbin
+    return np.bincount(flat, minlength=nmass * n_subbins).reshape(nmass, n_subbins).astype(np.int64)
 
 
 def build_mass_tabulation(
@@ -300,6 +346,7 @@ def build_mass_tabulation(
     logm_min: float | None = None,
     logm_max: float | None = None,
     logm_edges: np.ndarray | None = None,
+    mass_n_subbins: int = 20,
 ) -> MassTabulation:
     """Assign halos and NFW particles to host-halo mass bins."""
 
@@ -315,7 +362,7 @@ def build_mass_tabulation(
             raise ValueError("logm_max must be greater than logm_min.")
         edges = np.linspace(lower, np.nextafter(upper, np.inf), int(nmass_bins) + 1)
     else:
-        edges = np.asarray(logm_edges, dtype=np.float64)
+        edges = validate_logm_edges(logm_edges)
         nmass_bins = len(edges) - 1
 
     halo_bin = _assign_log_bins(log_mass, edges)
@@ -345,6 +392,9 @@ def build_mass_tabulation(
         particle_bin=particle_bin.astype(np.int32, copy=False),
         num_halo=num_halo,
         num_particle=num_particle,
+        halo_subbin_edges_log10=_mass_subbin_edges_log10(edges, mass_n_subbins),
+        halo_subbin_centers_log10=_mass_subbin_centers_log10(edges, mass_n_subbins),
+        num_halo_subbin=_halo_subbin_counts(log_mass, halo_bin, edges, mass_n_subbins),
     )
 
 
@@ -393,6 +443,7 @@ def load_prepared_binned_catalog(
     logm_min: float | None = None,
     logm_max: float | None = None,
     logm_edges: object | None = None,
+    mass_n_subbins: int = 20,
 ) -> tuple[BinnedPreparedCatalog, MassTabulation]:
     """Read prepared slabs into per-mass-bin position arrays for Corrfunc."""
 
@@ -441,11 +492,15 @@ def load_prepared_binned_catalog(
     else:
         nmass_bins = len(edges) - 1
 
+    mass_n_subbins = int(mass_n_subbins)
+    if mass_n_subbins <= 0:
+        raise ValueError("mass_n_subbins must be positive.")
     nmass = len(edges) - 1
     halo_chunks: list[list[np.ndarray]] = [[] for _ in range(nmass)]
     particle_chunks: list[list[np.ndarray]] = [[] for _ in range(nmass)]
     num_halo = np.zeros(nmass, dtype=np.int64)
     num_particle = np.zeros(nmass, dtype=np.int64)
+    num_halo_subbin = np.zeros((nmass, mass_n_subbins), dtype=np.int64)
     halo_mass_sum = np.zeros(nmass, dtype=np.float64)
     total_particles = 0
     position_dtype = np.dtype(dtype) if dtype is not None else None
@@ -462,11 +517,13 @@ def load_prepared_binned_catalog(
             )
             halo_n = _read_required_dataset(group, "N", pair.halo_file).astype(np.float64)
             halo_mass = halo_n * float(mpart)
-            halo_bin = _assign_log_bins(np.log10(halo_mass), edges)
+            log_mass = np.log10(halo_mass)
+            halo_bin = _assign_log_bins(log_mass, edges)
 
         valid_halo = halo_bin >= 0
         if np.any(valid_halo):
             num_halo += np.bincount(halo_bin[valid_halo], minlength=nmass)
+            num_halo_subbin += _halo_subbin_counts(log_mass, halo_bin, edges, mass_n_subbins)
             halo_mass_sum += np.bincount(
                 halo_bin[valid_halo],
                 weights=halo_mass[valid_halo],
@@ -508,6 +565,9 @@ def load_prepared_binned_catalog(
         particle_bin=np.empty(0, dtype=np.int32),
         num_halo=num_halo,
         num_particle=num_particle,
+        halo_subbin_edges_log10=_mass_subbin_edges_log10(edges, mass_n_subbins),
+        halo_subbin_centers_log10=_mass_subbin_centers_log10(edges, mass_n_subbins),
+        num_halo_subbin=num_halo_subbin,
     )
     attrs = _prepared_output_attrs(first_attrs, file_pairs, position_dataset)
     catalog = BinnedPreparedCatalog(
@@ -691,6 +751,14 @@ def _create_output_file(
     mass_group.create_dataset("mean_log10", data=mass_tab.mean_log10)
     mass_group.create_dataset("num_halo", data=mass_tab.num_halo)
     mass_group.create_dataset("num_particle", data=mass_tab.num_particle)
+    if mass_tab.halo_subbin_edges_log10 is not None:
+        mass_group.create_dataset("halo_subbin_edges_log10", data=mass_tab.halo_subbin_edges_log10)
+    if mass_tab.halo_subbin_centers_log10 is not None:
+        mass_group.create_dataset("halo_subbin_centers_log10", data=mass_tab.halo_subbin_centers_log10)
+    if mass_tab.num_halo_subbin is not None:
+        mass_group.create_dataset("num_halo_subbin", data=mass_tab.num_halo_subbin)
+        handle.attrs["mass_subbin_weighting"] = "halo_count"
+        handle.attrs["mass_n_subbins"] = int(mass_tab.num_halo_subbin.shape[1])
     counts_group = handle.create_group("counts")
     kwargs = {"compression": compression, "chunks": True} if compression else {}
     hh = counts_group.create_dataset("HH", shape=count_shape, dtype="u8", **kwargs)
@@ -760,7 +828,7 @@ def compute_rppi_paircounts(
         "n_mass_bins": nmass,
         "pi_max": float(pi_max),
         "rp_binning": str(rp_binning),
-        "schema_version": "paircounts_v1",
+        "schema_version": PAIRCOUNT_SCHEMA_VERSION,
     }
     handle, hh_ds, hp_ds, pp_ds = _create_output_file(
         output_path,
@@ -873,7 +941,7 @@ def compute_smu_paircounts(
         "mu_max": float(mu_max),
         "nmu_bins": int(nmu_bins),
         "s_binning": str(s_binning),
-        "schema_version": "paircounts_v1",
+        "schema_version": PAIRCOUNT_SCHEMA_VERSION,
     }
     handle, hh_ds, hp_ds, pp_ds = _create_output_file(
         output_path,
@@ -1031,6 +1099,200 @@ def find_paircount_file(
     raise ValueError(
         f"Found multiple paircount files matching {pattern} in {output_dir}; set file_tag."
     )
+
+
+def _assert_close_array(path: Path, name: str, actual: np.ndarray, expected: np.ndarray) -> None:
+    actual = np.asarray(actual, dtype=np.float64)
+    expected = np.asarray(expected, dtype=np.float64)
+    if actual.shape != expected.shape or not np.allclose(actual, expected, rtol=1.0e-10, atol=1.0e-10):
+        raise ValueError(
+            f"Paircount file {path} has {name} shape/value inconsistent with the current config: "
+            f"actual shape {actual.shape}, expected shape {expected.shape}."
+        )
+
+
+def _expected_mass_edges_from_config(mass_params: Mapping[str, Any], nmass_bins: int) -> np.ndarray | None:
+    logm_edges = mass_params.get("logm_edges")
+    if logm_edges is not None:
+        return parse_logm_edges(logm_edges)
+    logm_min = mass_params.get("logm_min")
+    logm_max = mass_params.get("logm_max")
+    if logm_min is None or logm_max is None:
+        return None
+    lower = float(logm_min)
+    upper = float(logm_max)
+    if upper <= lower:
+        raise ValueError("logm_max must be greater than logm_min.")
+    return np.linspace(lower, np.nextafter(upper, np.inf), int(nmass_bins) + 1)
+
+
+def _expected_mass_edge_bounds_from_config(mass_params: Mapping[str, Any]) -> tuple[float | None, float | None]:
+    if mass_params.get("logm_edges") is not None:
+        edges = parse_logm_edges(mass_params.get("logm_edges"))
+        return float(edges[0]), float(edges[-1])
+    lower = mass_params.get("logm_min")
+    upper = mass_params.get("logm_max")
+    if lower is not None and upper is not None and float(upper) <= float(lower):
+        raise ValueError("logm_max must be greater than logm_min.")
+    return (None if lower is None else float(lower), None if upper is None else float(upper))
+
+
+def _merged_bin_params(
+    pair_params: Mapping[str, Any],
+    job_params: Mapping[str, Any],
+    path_config: Mapping[str, Any],
+    name: str,
+) -> dict[str, Any]:
+    params = _merged_mapping(pair_params.get(name), job_params.get(name))
+    params.update(dict(path_config.get(name, {}) or {}))
+    for key in (
+        "nrp_bins",
+        "rp_min",
+        "rp_max",
+        "rp_binning",
+        "pi_max",
+        "ns_bins",
+        "s_min",
+        "s_max",
+        "s_binning",
+        "mu_max",
+        "nmu_bins",
+    ):
+        if key in path_config:
+            params[key] = path_config[key]
+    return params
+
+
+def _expected_paircount_bins(
+    clustering: str,
+    pair_params: Mapping[str, Any],
+    job_params: Mapping[str, Any],
+    path_config: Mapping[str, Any],
+) -> dict[str, np.ndarray]:
+    if clustering == "rppi":
+        params = _merged_bin_params(pair_params, job_params, path_config, "rppi")
+        nrp_bins = int(params.get("nrp_bins", pair_params.get("nrp_bins", 18)))
+        rp_min = float(params.get("rp_min", pair_params.get("rp_min", -1.5)))
+        rp_max = float(params.get("rp_max", pair_params.get("rp_max", 1.5)))
+        rp_binning = normalize_radial_binning(params.get("rp_binning", pair_params.get("rp_binning", "log10")))
+        pi_max = float(params.get("pi_max", pair_params.get("pi_max", 40.0)))
+        return {
+            "rp_edges": radial_bin_edges(nrp_bins, rp_min, rp_max, binning=rp_binning),
+            "pi_edges": np.arange(int(round(pi_max)) + 1, dtype=np.float64),
+        }
+    if clustering == "smu":
+        params = _merged_bin_params(pair_params, job_params, path_config, "smu")
+        ns_bins = int(params.get("ns_bins", pair_params.get("ns_bins", 18)))
+        s_min = float(params.get("s_min", pair_params.get("s_min", -1.5)))
+        s_max = float(params.get("s_max", pair_params.get("s_max", 1.5)))
+        s_binning = normalize_radial_binning(params.get("s_binning", pair_params.get("s_binning", "log10")))
+        mu_max = float(params.get("mu_max", pair_params.get("mu_max", 1.0)))
+        nmu_bins = int(params.get("nmu_bins", pair_params.get("nmu_bins", 100)))
+        return {
+            "s_edges": radial_bin_edges(ns_bins, s_min, s_max, binning=s_binning),
+            "mu_edges": np.linspace(0.0, mu_max, nmu_bins + 1),
+        }
+    raise ValueError(f"Unknown clustering type {clustering!r}.")
+
+
+def validate_paircount_file(
+    path: str | Path,
+    *,
+    expected_clustering: str | None = None,
+    expected_position_dataset: str | None = None,
+    expected_nmass_bins: int | None = None,
+    expected_mass_n_subbins: int | None = None,
+    expected_mass_edges_log10: np.ndarray | None = None,
+    expected_mass_min_log10: float | None = None,
+    expected_mass_max_log10: float | None = None,
+    expected_bins: Mapping[str, np.ndarray] | None = None,
+    expected_boxsize: float | None = None,
+    require_hod_subbins: bool = True,
+) -> Path:
+    """Validate that a paircount HDF5 file matches the requested tabulation."""
+
+    path = Path(path)
+    with h5py.File(path, "r") as handle:
+        attrs = {key: _decode_attr(value) for key, value in handle.attrs.items()}
+        if expected_clustering is not None and str(attrs.get("clustering")) != str(expected_clustering):
+            raise ValueError(f"Paircount file {path} is {attrs.get('clustering')!r}, expected {expected_clustering!r}.")
+        if expected_position_dataset is not None and str(attrs.get("position_dataset")) != str(expected_position_dataset):
+            raise ValueError(
+                f"Paircount file {path} uses position_dataset={attrs.get('position_dataset')!r}, "
+                f"expected {expected_position_dataset!r}."
+            )
+        if expected_nmass_bins is not None and int(attrs.get("n_mass_bins", -1)) != int(expected_nmass_bins):
+            raise ValueError(
+                f"Paircount file {path} has n_mass_bins={attrs.get('n_mass_bins')}, "
+                f"expected {int(expected_nmass_bins)}."
+            )
+        if expected_boxsize is not None and not np.isclose(float(attrs.get("boxsize", np.nan)), float(expected_boxsize)):
+            raise ValueError(f"Paircount file {path} has boxsize={attrs.get('boxsize')}, expected {expected_boxsize}.")
+        if "mass" not in handle or "bins" not in handle or "counts" not in handle:
+            raise ValueError(f"Paircount file {path} is missing required mass, bins, or counts groups.")
+        mass = handle["mass"]
+        bins_group = handle["bins"]
+        if expected_mass_edges_log10 is not None or expected_mass_min_log10 is not None or expected_mass_max_log10 is not None:
+            if "edges_log10" not in mass:
+                raise ValueError(f"Paircount file {path} is missing mass/edges_log10.")
+            edges_log10 = mass["edges_log10"][...]
+            if expected_mass_edges_log10 is not None:
+                _assert_close_array(path, "mass/edges_log10", edges_log10, expected_mass_edges_log10)
+            if expected_mass_min_log10 is not None and not np.isclose(edges_log10[0], float(expected_mass_min_log10), rtol=1.0e-10, atol=1.0e-10):
+                raise ValueError(
+                    f"Paircount file {path} has lower mass edge {edges_log10[0]}, "
+                    f"expected {float(expected_mass_min_log10)}."
+                )
+            if expected_mass_max_log10 is not None and not np.isclose(edges_log10[-1], float(expected_mass_max_log10), rtol=1.0e-10, atol=1.0e-10):
+                raise ValueError(
+                    f"Paircount file {path} has upper mass edge {edges_log10[-1]}, "
+                    f"expected {float(expected_mass_max_log10)}."
+                )
+        if expected_mass_n_subbins is not None:
+            attr_n = attrs.get("mass_n_subbins")
+            if attr_n is not None and int(attr_n) != int(expected_mass_n_subbins):
+                raise ValueError(
+                    f"Paircount file {path} has mass_n_subbins={int(attr_n)}, "
+                    f"expected {int(expected_mass_n_subbins)}."
+                )
+        if require_hod_subbins:
+            for name in ("halo_subbin_centers_log10", "num_halo_subbin"):
+                if name not in mass:
+                    raise ValueError(
+                        f"Paircount file {path} is missing mass/{name}. Recompute paircounts with "
+                        f"schema {PAIRCOUNT_SCHEMA_VERSION}."
+                    )
+            centers_shape = mass["halo_subbin_centers_log10"].shape
+            subbin_shape = mass["num_halo_subbin"].shape
+            if len(centers_shape) != 2 or len(subbin_shape) != 2:
+                raise ValueError(
+                    f"Paircount file {path} has malformed HOD subbin metadata: "
+                    f"halo_subbin_centers_log10 shape {centers_shape}, num_halo_subbin shape {subbin_shape}; "
+                    "expected both to be 2D."
+                )
+            if centers_shape != subbin_shape:
+                raise ValueError(
+                    f"Paircount file {path} has inconsistent HOD subbin metadata: "
+                    f"halo_subbin_centers_log10 shape {centers_shape}, num_halo_subbin shape {subbin_shape}."
+                )
+            if expected_nmass_bins is not None and int(subbin_shape[0]) != int(expected_nmass_bins):
+                raise ValueError(
+                    f"Paircount file {path} has num_halo_subbin shape {subbin_shape}, "
+                    f"expected first dimension {int(expected_nmass_bins)}."
+                )
+            if expected_mass_n_subbins is not None and int(subbin_shape[1]) != int(expected_mass_n_subbins):
+                raise ValueError(
+                    f"Paircount file {path} has num_halo_subbin shape {subbin_shape}, "
+                    f"expected second dimension {int(expected_mass_n_subbins)}."
+                )
+            weighting = attrs.get("mass_subbin_weighting")
+            if weighting is not None and str(weighting) != "halo_count":
+                raise ValueError(f"Paircount file {path} uses mass_subbin_weighting={weighting!r}, expected 'halo_count'.")
+        for name, expected in (expected_bins or {}).items():
+            if name not in bins_group:
+                raise ValueError(f"Paircount file {path} is missing bins/{name}.")
+            _assert_close_array(path, f"bins/{name}", bins_group[name][...], expected)
+    return path
 
 
 def _first_not_none(*values: Any) -> Any:
@@ -1213,6 +1475,7 @@ def _compute_config_job(
     logm_min: float | None,
     logm_max: float | None,
     logm_edges: object | None,
+    mass_n_subbins: int | None,
     nrp_bins: int | None,
     rp_min: float | None,
     rp_max: float | None,
@@ -1261,6 +1524,15 @@ def _compute_config_job(
     effective_logm_min = _first_not_none(logm_min, mass_params.get("logm_min"), pair_params.get("logm_min"))
     effective_logm_max = _first_not_none(logm_max, mass_params.get("logm_max"), pair_params.get("logm_max"))
     effective_logm_edges = _first_not_none(logm_edges, mass_params.get("logm_edges"), pair_params.get("logm_edges"))
+    effective_mass_n_subbins = int(
+        _first_not_none(
+            mass_n_subbins,
+            mass_params.get("n_subbins"),
+            mass_params.get("mass_n_subbins"),
+            pair_params.get("mass_n_subbins"),
+            20,
+        )
+    )
     effective_hdf5_compression = _first_not_none(
         hdf5_compression,
         job_params.get("hdf5_compression"),
@@ -1280,6 +1552,7 @@ def _compute_config_job(
         logm_min=effective_logm_min,
         logm_max=effective_logm_max,
         logm_edges=effective_logm_edges,
+        mass_n_subbins=effective_mass_n_subbins,
     )
     return compute_paircounts_for_binned_catalog(
         catalog,
@@ -1336,6 +1609,7 @@ def _binned_catalog_cache_key(
     logm_min: float | None,
     logm_max: float | None,
     logm_edges: object | None,
+    mass_n_subbins: int,
 ) -> tuple[Any, ...]:
     return (
         str(Path(prepared_dir)),
@@ -1347,6 +1621,7 @@ def _binned_catalog_cache_key(
         None if logm_min is None else float(logm_min),
         None if logm_max is None else float(logm_max),
         _cache_piece(logm_edges),
+        int(mass_n_subbins),
     )
 
 
@@ -1362,6 +1637,7 @@ def _load_cached_binned_catalog(
     logm_min: float | None,
     logm_max: float | None,
     logm_edges: object | None,
+    mass_n_subbins: int,
 ) -> tuple[BinnedPreparedCatalog, MassTabulation]:
     key = _binned_catalog_cache_key(
         prepared_dir=prepared_dir,
@@ -1373,6 +1649,7 @@ def _load_cached_binned_catalog(
         logm_min=logm_min,
         logm_max=logm_max,
         logm_edges=logm_edges,
+        mass_n_subbins=mass_n_subbins,
     )
     if cache is not None and key in cache:
         print("reusing prepared catalog mass bins", flush=True)
@@ -1389,6 +1666,7 @@ def _load_cached_binned_catalog(
         logm_min=logm_min,
         logm_max=logm_max,
         logm_edges=logm_edges,
+        mass_n_subbins=int(mass_n_subbins),
     )
     print(
         f"loaded halos={catalog.n_halos:,} particles={catalog.n_particles:,} "
@@ -1506,6 +1784,7 @@ def compute_paircounts_from_prepared(
     logm_min: float | None = None,
     logm_max: float | None = None,
     logm_edges: object | None = None,
+    mass_n_subbins: int = 20,
     nrp_bins: int = 18,
     rp_min: float = -1.5,
     rp_max: float = 1.5,
@@ -1532,6 +1811,7 @@ def compute_paircounts_from_prepared(
         logm_min=logm_min,
         logm_max=logm_max,
         logm_edges=logm_edges,
+        mass_n_subbins=int(mass_n_subbins),
     )
     return compute_paircounts_for_binned_catalog(
         catalog,
@@ -1576,6 +1856,7 @@ def paircounts_from_config(
     logm_min: float | None = None,
     logm_max: float | None = None,
     logm_edges: object | None = None,
+    mass_n_subbins: int | None = None,
     nrp_bins: int | None = None,
     rp_min: float | None = None,
     rp_max: float | None = None,
@@ -1621,6 +1902,7 @@ def paircounts_from_config(
         logm_min=logm_min,
         logm_max=logm_max,
         logm_edges=logm_edges,
+        mass_n_subbins=mass_n_subbins,
         nrp_bins=nrp_bins,
         rp_min=rp_min,
         rp_max=rp_max,
@@ -1666,6 +1948,7 @@ def paircounts_from_config(
     )
 
 
+
 def resolve_paircount_path_from_config(
     config: Mapping[str, Any],
     *,
@@ -1676,14 +1959,6 @@ def resolve_paircount_path_from_config(
     """Resolve a paircount file path from config, including named jobs."""
 
     path_config = dict(path_config or {})
-    if path_config.get("path") is not None:
-        sim_params = config.get("sim_params", {})
-        return _format_exact_path(
-            path_config["path"],
-            sim_name=str(sim_params.get("sim_name", "")),
-            z_mock=float(sim_params.get("z_mock", 0.0)),
-        )
-
     pair_params = config.get("paircounts", {})
     paths_params = config.get("paths", {})
     sim_params = config.get("sim_params", {})
@@ -1697,18 +1972,10 @@ def resolve_paircount_path_from_config(
     job_params = dict(jobs.get(selected_job, {}) if selected_job is not None else {})
 
     mass_params = _merged_mapping(pair_params.get("mass"), job_params.get("mass"))
-    output_value = path_config.get(
-        "dir",
-        path_config.get("paircounts_dir", path_config.get("output_dir")),
-    )
-    append_job = bool(jobs and selected_job is not None and output_value is None and job_params.get("output_dir") is None)
-    if output_value is None:
-        output_value = _first_not_none(job_params.get("output_dir"), pair_params.get("output_dir"), paths_params.get("paircounts_dir"))
-    if output_value is None:
-        raise KeyError("Set paircounts.output_dir or an explicit paircount path.")
-    output_dir = _format_config_path(output_value, sim_name=sim_name, z_mock=z_mock)
-    if append_job:
-        output_dir = output_dir / _sanitize_filename_piece(selected_job)
+    mass_params.update(dict(path_config.get("mass", {}) or {}))
+    for key in ("nmass_bins", "logm_min", "logm_max", "logm_edges", "n_subbins", "mass_n_subbins"):
+        if key in path_config:
+            mass_params[key] = path_config[key]
 
     position_dataset = str(
         _first_not_none(
@@ -1723,19 +1990,85 @@ def resolve_paircount_path_from_config(
         job_params.get("file_tag"),
         pair_params.get("file_tag"),
     )
-    nmass_bins = int(
+    configured_mass_edges = (
+        parse_logm_edges(mass_params.get("logm_edges"))
+        if mass_params.get("logm_edges") is not None
+        else None
+    )
+    nmass_bins = (
+        len(configured_mass_edges) - 1
+        if configured_mass_edges is not None
+        else int(
+            _first_not_none(
+                path_config.get("nmass_bins"),
+                mass_params.get("nmass_bins"),
+                pair_params.get("nmass_bins"),
+                20,
+            )
+        )
+    )
+    expected_mass_n_subbins = int(
         _first_not_none(
-            path_config.get("nmass_bins"),
-            mass_params.get("nmass_bins"),
-            pair_params.get("nmass_bins"),
+            path_config.get("mass_n_subbins"),
+            path_config.get("n_subbins"),
+            mass_params.get("n_subbins"),
+            mass_params.get("mass_n_subbins"),
+            pair_params.get("mass_n_subbins"),
             20,
         )
     )
-    return find_paircount_file(
+
+    if path_config.get("path") is not None:
+        expected_mass_min, expected_mass_max = _expected_mass_edge_bounds_from_config(mass_params)
+        paircount_path = _format_exact_path(path_config["path"], sim_name=sim_name, z_mock=z_mock)
+        return validate_paircount_file(
+            paircount_path,
+            expected_clustering=clustering,
+            expected_position_dataset=position_dataset,
+            expected_nmass_bins=nmass_bins,
+            expected_mass_n_subbins=expected_mass_n_subbins,
+            expected_mass_edges_log10=configured_mass_edges
+            if configured_mass_edges is not None
+            else _expected_mass_edges_from_config(mass_params, nmass_bins),
+            expected_mass_min_log10=expected_mass_min,
+            expected_mass_max_log10=expected_mass_max,
+            expected_bins=_expected_paircount_bins(clustering, pair_params, job_params, path_config),
+            expected_boxsize=_first_not_none(path_config.get("boxsize"), job_params.get("boxsize"), pair_params.get("boxsize")),
+        )
+
+    output_value = path_config.get(
+        "dir",
+        path_config.get("paircounts_dir", path_config.get("output_dir")),
+    )
+    append_job = bool(jobs and selected_job is not None and output_value is None and job_params.get("output_dir") is None)
+    if output_value is None:
+        output_value = _first_not_none(job_params.get("output_dir"), pair_params.get("output_dir"), paths_params.get("paircounts_dir"))
+    if output_value is None:
+        raise KeyError("Set paircounts.output_dir or an explicit paircount path.")
+    output_dir = _format_config_path(output_value, sim_name=sim_name, z_mock=z_mock)
+    if append_job:
+        output_dir = output_dir / _sanitize_filename_piece(selected_job)
+
+    expected_mass_min, expected_mass_max = _expected_mass_edge_bounds_from_config(mass_params)
+    paircount_path = find_paircount_file(
         output_dir,
         clustering=clustering,
         position_dataset=position_dataset,
         file_tag=file_tag,
         nmass_bins=nmass_bins,
         job_name=selected_job if jobs else None,
+    )
+    return validate_paircount_file(
+        paircount_path,
+        expected_clustering=clustering,
+        expected_position_dataset=position_dataset,
+        expected_nmass_bins=nmass_bins,
+        expected_mass_n_subbins=expected_mass_n_subbins,
+        expected_mass_edges_log10=configured_mass_edges
+        if configured_mass_edges is not None
+        else _expected_mass_edges_from_config(mass_params, nmass_bins),
+        expected_mass_min_log10=expected_mass_min,
+        expected_mass_max_log10=expected_mass_max,
+        expected_bins=_expected_paircount_bins(clustering, pair_params, job_params, path_config),
+        expected_boxsize=_first_not_none(path_config.get("boxsize"), job_params.get("boxsize"), pair_params.get("boxsize")),
     )

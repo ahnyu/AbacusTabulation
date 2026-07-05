@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import warnings
 from typing import Any, Mapping
 
 import h5py
@@ -11,6 +12,9 @@ import numpy as np
 
 from .hod import evaluate_hod
 from .paircounts import find_prepared_file_pairs, parse_logm_edges
+
+
+_HMF_EDGE_FRACTION_WARN = 1.0e-3
 
 
 @dataclass(frozen=True)
@@ -192,6 +196,8 @@ def build_hmf_from_prepared(
             "Mpart": float(mpart),
             "n_halos": int(total_halos),
             "n_bins": int(n_bins),
+            "logm_min": float(edges[0]),
+            "logm_max": float(edges[-1]),
             "prepared_tags": ",".join(tags),
             "prepared_seeds": ",".join(str(item) for item in seeds),
             "prepared_slabs": ",".join(str(pair.slab) for pair in file_pairs),
@@ -325,22 +331,144 @@ def _path_format_values(config: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _assert_close_array(path: Path, name: str, actual: np.ndarray, expected: np.ndarray) -> None:
+    actual = np.asarray(actual, dtype=np.float64)
+    expected = np.asarray(expected, dtype=np.float64)
+    if actual.shape != expected.shape or not np.allclose(actual, expected, rtol=1.0e-10, atol=1.0e-10):
+        raise ValueError(
+            f"HMF file {path} has {name} shape/value inconsistent with the current config: "
+            f"actual shape {actual.shape}, expected shape {expected.shape}."
+        )
+
+
+def _expected_hmf_edges(
+    *,
+    n_bins: int,
+    logm_edges: object | None = None,
+    logm_min: float | None = None,
+    logm_max: float | None = None,
+) -> np.ndarray | None:
+    if logm_edges is not None:
+        return parse_logm_edges(logm_edges)
+    if logm_min is None or logm_max is None:
+        return None
+    lower = float(logm_min)
+    upper = float(logm_max)
+    if upper <= lower:
+        raise ValueError("logm_max must be greater than logm_min.")
+    return np.linspace(lower, np.nextafter(upper, np.inf), int(n_bins) + 1)
+
+
+def validate_hmf_file(
+    path: str | Path,
+    *,
+    expected_n_bins: int | None = None,
+    expected_logm_edges: np.ndarray | None = None,
+    expected_logm_min: float | None = None,
+    expected_logm_max: float | None = None,
+) -> Path:
+    """Validate that an HMF HDF5 file matches the requested HMF tabulation."""
+
+    path = Path(path)
+    with h5py.File(path, "r") as handle:
+        if "hmf" not in handle:
+            raise ValueError(f"HMF file {path} is missing the hmf group.")
+        group = handle["hmf"]
+        if "logm_edges" not in group or "dndlog10m" not in group:
+            raise ValueError(f"HMF file {path} is missing hmf/logm_edges or hmf/dndlog10m.")
+        edges = group["logm_edges"][...]
+        n_bins = len(edges) - 1
+        if expected_n_bins is not None and n_bins != int(expected_n_bins):
+            raise ValueError(f"HMF file {path} has {n_bins} bins, expected {int(expected_n_bins)}.")
+        if expected_logm_edges is not None:
+            _assert_close_array(path, "hmf/logm_edges", edges, expected_logm_edges)
+        if expected_logm_min is not None and not np.isclose(edges[0], float(expected_logm_min), rtol=1.0e-10, atol=1.0e-10):
+            raise ValueError(f"HMF file {path} has lower mass edge {edges[0]}, expected {float(expected_logm_min)}.")
+        if expected_logm_max is not None and not np.isclose(edges[-1], float(expected_logm_max), rtol=1.0e-10, atol=1.0e-10):
+            raise ValueError(f"HMF file {path} has upper mass edge {edges[-1]}, expected {float(expected_logm_max)}.")
+    return path
+
+
+def _expected_hmf_edge_bounds(
+    *,
+    logm_edges: object | None = None,
+    logm_min: float | None = None,
+    logm_max: float | None = None,
+) -> tuple[float | None, float | None]:
+    if logm_edges is not None:
+        edges = parse_logm_edges(logm_edges)
+        return float(edges[0]), float(edges[-1])
+    if logm_min is not None and logm_max is not None and float(logm_max) <= float(logm_min):
+        raise ValueError("logm_max must be greater than logm_min.")
+    return (
+        None if logm_min is None else float(logm_min),
+        None if logm_max is None else float(logm_max),
+    )
+
+
+def validate_hmf_file_for_config(
+    path: str | Path,
+    *,
+    n_bins: int = 512,
+    logm_edges: object | None = None,
+    logm_min: float | None = None,
+    logm_max: float | None = None,
+) -> Path:
+    """Validate an explicit HMF path against the configured HMF tabulation."""
+
+    expected_edges = _expected_hmf_edges(
+        n_bins=int(n_bins),
+        logm_edges=logm_edges,
+        logm_min=logm_min,
+        logm_max=logm_max,
+    )
+    expected_min, expected_max = _expected_hmf_edge_bounds(
+        logm_edges=logm_edges,
+        logm_min=logm_min,
+        logm_max=logm_max,
+    )
+    expected_n_bins = len(expected_edges) - 1 if expected_edges is not None else int(n_bins)
+    return validate_hmf_file(
+        path,
+        expected_n_bins=expected_n_bins,
+        expected_logm_edges=expected_edges,
+        expected_logm_min=expected_min,
+        expected_logm_max=expected_max,
+    )
+
+
 def find_hmf_file(
     output_dir: str | Path,
     *,
     file_tag: str | None = None,
     seed: int | str | None = None,
     n_bins: int = 512,
+    logm_edges: object | None = None,
+    logm_min: float | None = None,
+    logm_max: float | None = None,
 ) -> Path:
-    """Find one HMF file in an output directory."""
+    """Find one HMF file in an output directory and validate known config fields."""
 
     output_dir = Path(output_dir)
     tag = _sanitize_filename_piece(file_tag) if file_tag is not None else "*"
     seed_piece = _sanitize_filename_piece(f"seed{seed}") if seed is not None else "seed*"
-    pattern = f"hmf_{tag}_{seed_piece}_n{int(n_bins)}.h5"
+    expected_edges = _expected_hmf_edges(
+        n_bins=int(n_bins),
+        logm_edges=logm_edges,
+        logm_min=logm_min,
+        logm_max=logm_max,
+    )
+    effective_n_bins = len(expected_edges) - 1 if expected_edges is not None else int(n_bins)
+    pattern = f"hmf_{tag}_{seed_piece}_n{effective_n_bins}.h5"
     matches = sorted(output_dir.glob(pattern))
     if len(matches) == 1:
-        return matches[0]
+        return validate_hmf_file_for_config(
+            matches[0],
+            n_bins=effective_n_bins,
+            logm_edges=logm_edges,
+            logm_min=logm_min,
+            logm_max=logm_max,
+        )
     if not matches:
         raise FileNotFoundError(f"No HMF file matching {pattern} in {output_dir}.")
     raise ValueError(f"Found multiple HMF files matching {pattern} in {output_dir}; set hmf.file_tag and hmf.seed.")
@@ -350,6 +478,27 @@ def hmf_density_weights(hmf: HaloMassFunction) -> np.ndarray:
     """Return per-logM-bin number-density weights, dndlog10M * dlog10M."""
 
     return np.asarray(hmf.density_per_bin, dtype=np.float64)
+
+
+def _warn_if_hmf_edges_contribute(hmf: HaloMassFunction, occupation: np.ndarray) -> None:
+    weights = np.asarray(occupation, dtype=np.float64) * hmf_density_weights(hmf)
+    if weights.size == 0:
+        return
+    finite = np.isfinite(weights)
+    if not np.any(finite):
+        return
+    total = float(np.sum(weights[finite]))
+    if total <= 0.0:
+        return
+    lower = float(weights[0] / total) if np.isfinite(weights[0]) else 0.0
+    upper = float(weights[-1] / total) if np.isfinite(weights[-1]) else 0.0
+    if max(lower, upper) > _HMF_EDGE_FRACTION_WARN:
+        warnings.warn(
+            "The first or last HMF bin contributes more than 0.1% of the HOD number density. "
+            "Consider widening hmf.logm_min/hmf.logm_max for derived quantities.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
 
 
 def hod_occupation_on_hmf(
@@ -362,7 +511,10 @@ def hod_occupation_on_hmf(
 
     mass = 10.0 ** np.asarray(hmf.logm_centers, dtype=np.float64)
     cen, sat = evaluate_hod(mass, hod_params, model=hod_model)
-    return np.asarray(cen, dtype=np.float64), np.asarray(sat, dtype=np.float64)
+    cen = np.asarray(cen, dtype=np.float64)
+    sat = np.asarray(sat, dtype=np.float64)
+    _warn_if_hmf_edges_contribute(hmf, cen + sat)
+    return cen, sat
 
 
 def hod_central_number_density(

@@ -47,6 +47,8 @@ With the default config, this computes both:
 - `paircounts.jobs.clustering`: the rppi/smu tables for HOD clustering
 - `paircounts.jobs.linear_bias`: the real-space smu table for linear-bias postprocessing
 
+Paircount files must store `mass/num_halo_subbin` and `mass/halo_subbin_centers_log10` for halo-count-weighted HOD refinement. Downstream clustering, fitting, and derived tabulators infer the subbin count from the paircount file; older paircount files without this metadata need to be recomputed.
+
 Set `paircounts.jobs.clustering.position_dataset: pos_rsd` if the fitted clustering should use RSD positions. Keep `paircounts.jobs.linear_bias.position_dataset: pos`.
 
 Avoid global CLI overrides like `--position-dataset pos_rsd` when computing both default jobs, because the linear-bias job must remain real space.

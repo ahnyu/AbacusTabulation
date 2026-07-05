@@ -14,6 +14,8 @@ paircounts:
   prepared_dir: /cluster/path/prepared
   output_dir: /cluster/path/paircounts
   file_tag: abacustab_profiles_conc-r98-L2com-over-r25-L2com
+  mass:
+    n_subbins: 20
 
 hmf:
   prepared_dir: /cluster/path/prepared
@@ -31,7 +33,6 @@ derived:
 
 hod:
   model: lrg
-  n_subbins: 20
   params:
     sigma: 0.4
     logM1: 14.0
@@ -66,7 +67,6 @@ fit:
     tracers:
       LRG:
         hod_model: lrg
-        n_subbins: 20
         paircounts:
           rppi:
             path: null

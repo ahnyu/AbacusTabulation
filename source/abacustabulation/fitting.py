@@ -9,7 +9,13 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from .clustering import HODClusteringTabulator, projected_wp, smu_multipoles
-from .hmf import HaloMassFunction, find_hmf_file, hod_number_density, read_hmf
+from .hmf import (
+    HaloMassFunction,
+    find_hmf_file,
+    hod_number_density,
+    read_hmf,
+    validate_hmf_file_for_config,
+)
 
 
 ArrayLike = np.ndarray | Sequence[float]
@@ -41,7 +47,6 @@ class ObservableSpec:
     clustering: str
     paircount_path: Path
     hod_model: str
-    n_subbins: int
     selection: Any = None
 
     @property
@@ -49,8 +54,8 @@ class ObservableSpec:
         return f"{self.tracer}.{self.statistic}"
 
     @property
-    def tabulator_key(self) -> tuple[Path, int]:
-        return (self.paircount_path, self.n_subbins)
+    def tabulator_key(self) -> Path:
+        return self.paircount_path
 
 
 @dataclass(frozen=True)
@@ -217,7 +222,8 @@ class HODFittingProblem:
 
         parameters = _parse_parameters(_required(fit_config, "parameters"))
         observables = _parse_observable_specs(config, fit_config, tracers)
-        data_segments = _load_observable_data(config, fit_config, observables)
+        tabulators = _load_observable_tabulators(observables)
+        data_segments = _load_observable_data(config, fit_config, observables, tabulators)
         covariance = _load_fit_covariance(config, fit_config, data_segments)
         covariance_config = fit_config.get("covariance", {})
         values = np.concatenate([segment.values for segment in data_segments])
@@ -229,14 +235,6 @@ class HODFittingProblem:
             inversion=str(covariance_config.get("inversion", "inv")),
             precision_scale=_precision_scale(covariance_config, values.size),
         )
-
-        tabulators: dict[tuple[Path, int], HODClusteringTabulator] = {}
-        for spec in observables:
-            if spec.tabulator_key not in tabulators:
-                tabulators[spec.tabulator_key] = HODClusteringTabulator.from_paircount_file(
-                    spec.paircount_path,
-                    n_subbins=spec.n_subbins,
-                )
 
         density_constraints = _parse_density_constraints(fit_config, tracers)
         problem = cls(
@@ -350,9 +348,9 @@ class HODFittingProblem:
         theta = self._theta(theta)
         segments = []
         densities: dict[str, float] = {}
-        result_cache: dict[tuple[str, Path, int, str], Any] = {}
+        result_cache: dict[tuple[str, Path, str], Any] = {}
         for spec in self.observables:
-            cache_key = (spec.tracer, spec.paircount_path, spec.n_subbins, spec.hod_model)
+            cache_key = (spec.tracer, spec.paircount_path, spec.hod_model)
             if cache_key not in result_cache:
                 tabulator = self._tabulator_for_spec(spec)
                 result_cache[cache_key] = tabulator.correlation(
@@ -468,7 +466,6 @@ def _parse_observable_specs(
                 clustering=clustering,
                 paircount_path=paircount_path,
                 hod_model=str(obs.get("hod_model", theory.get("hod_model", config.get("hod", {}).get("model", "lrg")))),
-                n_subbins=int(obs.get("n_subbins", theory.get("n_subbins", config.get("hod", {}).get("n_subbins", 20)))),
                 selection=obs.get("slice", obs.get("selection")),
             )
         )
@@ -496,12 +493,10 @@ def _observable_paircount_path(
     clustering: str,
     obs: Mapping[str, Any],
 ) -> Path:
-    if obs.get("paircount_path") is not None:
-        return _format_config_path(obs["paircount_path"], config)
     theory = _tracer_theory_config(fit_config, tracer)
-    paircount_config = theory.get("paircounts", {}).get(clustering, {})
-    if paircount_config.get("path") is not None:
-        return _format_config_path(paircount_config["path"], config)
+    paircount_config = dict(theory.get("paircounts", {}).get(clustering, {}) or {})
+    if obs.get("paircount_path") is not None:
+        paircount_config["path"] = obs["paircount_path"]
     return _resolve_paircount_path(config, paircount_config, clustering=clustering)
 
 
@@ -510,18 +505,27 @@ def _tracer_theory_config(fit_config: Mapping[str, Any], tracer: str) -> Mapping
     return theory.get("tracers", {}).get(tracer, {})
 
 
+def _load_observable_tabulators(observables: Sequence[ObservableSpec]) -> dict[Path, HODClusteringTabulator]:
+    tabulators: dict[Path, HODClusteringTabulator] = {}
+    for spec in observables:
+        if spec.tabulator_key not in tabulators:
+            tabulators[spec.tabulator_key] = HODClusteringTabulator.from_paircount_file(spec.paircount_path)
+    return tabulators
+
+
 def _load_observable_data(
     config: Mapping[str, Any],
     fit_config: Mapping[str, Any],
     observables: Sequence[ObservableSpec],
+    tabulators: Mapping[Path, HODClusteringTabulator],
 ) -> tuple[ObservableDataSegment, ...]:
     data_cache: dict[tuple[str, str, str], np.ndarray] = {}
     segments = []
     for spec in observables:
         raw_values = _load_statistic_data(config, fit_config, spec, data_cache)
-        max_bins = _configured_bin_count(config, spec)
+        theory_bins = _observable_theory_bin_count(spec, tabulators)
         indices = _selection_indices(raw_values.size, spec.selection)
-        _validate_selection(spec, raw_values.size, indices, max_bins)
+        _validate_selection(spec, raw_values.size, indices, theory_bins)
         segments.append(
             ObservableDataSegment(
                 spec=spec,
@@ -568,37 +572,43 @@ def _tracer_data_config(fit_config: Mapping[str, Any], tracer: str) -> Mapping[s
     return tracers[tracer]
 
 
+def _observable_theory_bin_count(
+    spec: ObservableSpec,
+    tabulators: Mapping[Path, HODClusteringTabulator],
+) -> int:
+    tabulator = tabulators.get(spec.tabulator_key, tabulators.get(spec.paircount_path))
+    if tabulator is None:
+        raise KeyError(f"No tabulator loaded for {spec.paircount_path}.")
+    bins = tabulator.paircounts.bins
+    if spec.statistic == "wp":
+        if "rp_edges" not in bins:
+            raise ValueError(f"Paircount file {spec.paircount_path} is missing bins/rp_edges for wp.")
+        return int(len(bins["rp_edges"]) - 1)
+    if "s_edges" not in bins:
+        raise ValueError(f"Paircount file {spec.paircount_path} is missing bins/s_edges for {spec.statistic}.")
+    return int(len(bins["s_edges"]) - 1)
+
+
 def _validate_selection(
     spec: ObservableSpec,
-    full_size: int,
+    data_size: int,
     indices: np.ndarray,
-    configured_bins: int | None,
+    theory_bins: int,
 ) -> None:
     if indices.size == 0:
         raise ValueError(f"Observable {spec.key} selection is empty.")
-    if np.any(indices < 0) or np.any(indices >= full_size):
-        raise ValueError(f"Observable {spec.key} selection is outside data length {full_size}.")
-    if configured_bins is not None and indices.size > configured_bins:
+    if np.any(indices < 0) or np.any(indices >= data_size):
+        raise ValueError(f"Observable {spec.key} selection is outside data length {data_size}.")
+    if np.any(indices >= theory_bins):
         raise ValueError(
-            f"Observable {spec.key} uses {indices.size} bins; configured maximum is {configured_bins}."
+            f"Observable {spec.key} selection reaches bin {int(np.max(indices))}, "
+            f"but the paircount table only has {theory_bins} bins."
         )
-
-
-def _configured_bin_count(config: Mapping[str, Any], spec: ObservableSpec) -> int | None:
-    pair_params = config.get("paircounts", {})
-    job_params = {}
-    jobs = pair_params.get("jobs") or {}
-    if jobs:
-        job_params = dict(jobs.get("clustering", {}))
-    if spec.statistic == "wp":
-        params = dict(pair_params.get("rppi", {}))
-        params.update(dict(job_params.get("rppi", {})))
-        value = params.get("nrp_bins")
-    else:
-        params = dict(pair_params.get("smu", {}))
-        params.update(dict(job_params.get("smu", {})))
-        value = params.get("ns_bins")
-    return None if value is None else int(value)
+    if spec.selection is None and data_size != theory_bins:
+        raise ValueError(
+            f"Observable {spec.key} has data length {data_size}, but the paircount table has "
+            f"{theory_bins} bins. Set an observable slice to align them."
+        )
 
 
 def _load_fit_covariance(
@@ -724,7 +734,13 @@ def _resolve_hmf_path(config: Mapping[str, Any], fit_config: Mapping[str, Any], 
     tracer_hmf = _tracer_theory_config(fit_config, tracer).get("hmf", {})
     hmf_config.update(tracer_hmf)
     if hmf_config.get("path") is not None:
-        return _format_config_path(hmf_config["path"], config)
+        return validate_hmf_file_for_config(
+            _format_config_path(hmf_config["path"], config),
+            n_bins=int(hmf_config.get("n_bins", 512)),
+            logm_edges=hmf_config.get("logm_edges"),
+            logm_min=hmf_config.get("logm_min"),
+            logm_max=hmf_config.get("logm_max"),
+        )
     pair_params = config.get("paircounts", {})
     prepare_params = config.get("prepare_profiles", {})
     output_value = hmf_config.get("output_dir", hmf_config.get("out_dir"))
@@ -738,6 +754,9 @@ def _resolve_hmf_path(config: Mapping[str, Any], fit_config: Mapping[str, Any], 
         file_tag=_first_not_none(hmf_config.get("file_tag"), pair_params.get("file_tag")),
         seed=_first_not_none(hmf_config.get("seed"), pair_params.get("seed"), prepare_params.get("seed")),
         n_bins=int(hmf_config.get("n_bins", 512)),
+        logm_edges=hmf_config.get("logm_edges"),
+        logm_min=hmf_config.get("logm_min"),
+        logm_max=hmf_config.get("logm_max"),
     )
 
 

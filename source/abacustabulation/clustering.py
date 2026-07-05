@@ -24,6 +24,9 @@ class PairCountTable:
     num_particle: np.ndarray
     bins: dict[str, np.ndarray]
     attrs: dict[str, Any]
+    mass_subbin_edges_log10: np.ndarray | None = None
+    mass_subbin_centers_log10: np.ndarray | None = None
+    num_halo_subbin: np.ndarray | None = None
 
 
 @dataclass
@@ -36,6 +39,7 @@ class HODBinWeights:
     n_galaxies: float
     n_centrals: float
     n_satellites: float
+    subbin_weighting: str = "halo_count"
 
 
 @dataclass
@@ -70,6 +74,21 @@ def read_paircounts(path: str | Path) -> PairCountTable:
         mass = handle["mass"]
         bins_group = handle["bins"]
         bins = {key: bins_group[key][...] for key in bins_group.keys()}
+        mass_subbin_edges = (
+            mass["halo_subbin_edges_log10"][...].astype(np.float64)
+            if "halo_subbin_edges_log10" in mass
+            else None
+        )
+        mass_subbin_centers = (
+            mass["halo_subbin_centers_log10"][...].astype(np.float64)
+            if "halo_subbin_centers_log10" in mass
+            else None
+        )
+        num_halo_subbin = (
+            mass["num_halo_subbin"][...].astype(np.float64)
+            if "num_halo_subbin" in mass
+            else None
+        )
         return PairCountTable(
             clustering=str(attrs["clustering"]),
             counts_hh=counts["HH"][...].astype(np.float64),
@@ -81,18 +100,10 @@ def read_paircounts(path: str | Path) -> PairCountTable:
             num_particle=mass["num_particle"][...].astype(np.float64),
             bins=bins,
             attrs=attrs,
+            mass_subbin_edges_log10=mass_subbin_edges,
+            mass_subbin_centers_log10=mass_subbin_centers,
+            num_halo_subbin=num_halo_subbin,
         )
-
-
-def _mass_subcenters_log10(edges: np.ndarray, n_subbins: int) -> np.ndarray:
-    edges = np.asarray(edges, dtype=np.float64)
-    n_subbins = int(n_subbins)
-    if edges.ndim != 1 or len(edges) < 2:
-        raise ValueError("mass edges must be one-dimensional with at least two entries.")
-    if n_subbins <= 0:
-        raise ValueError("n_subbins must be positive.")
-    centers = (np.arange(n_subbins, dtype=np.float64) + 0.5) / n_subbins
-    return edges[:-1, None] + np.diff(edges)[:, None] * centers[None, :]
 
 
 def _hod_weights_from_subcenters(
@@ -103,6 +114,7 @@ def _hod_weights_from_subcenters(
     hod_params: Mapping[str, Any],
     *,
     hod_model: str,
+    num_halo_subbin: np.ndarray,
 ) -> HODBinWeights:
     edges = np.asarray(mass_edges_log10, dtype=np.float64)
     subcenters = np.asarray(mass_subcenters_log10, dtype=np.float64)
@@ -110,8 +122,28 @@ def _hod_weights_from_subcenters(
     num_particle = np.asarray(num_particle, dtype=np.float64)
 
     cen_sub, sat_sub = evaluate_hod(10.0**subcenters, hod_params, model=hod_model)
-    central = np.mean(np.asarray(cen_sub, dtype=np.float64), axis=1)
-    satellite = np.mean(np.asarray(sat_sub, dtype=np.float64), axis=1)
+    cen_sub = np.asarray(cen_sub, dtype=np.float64)
+    sat_sub = np.asarray(sat_sub, dtype=np.float64)
+    counts = np.asarray(num_halo_subbin, dtype=np.float64)
+    if counts.shape != subcenters.shape:
+        raise ValueError(
+            f"num_halo_subbin shape {counts.shape} does not match HOD subcenters {subcenters.shape}."
+        )
+    sub_totals = np.sum(counts, axis=1)
+    if not np.allclose(sub_totals, num_halo):
+        raise ValueError("num_halo_subbin does not sum to the coarse mass-bin num_halo values.")
+    central = np.divide(
+        np.sum(cen_sub * counts, axis=1),
+        sub_totals,
+        out=np.zeros_like(sub_totals, dtype=np.float64),
+        where=sub_totals > 0.0,
+    )
+    satellite = np.divide(
+        np.sum(sat_sub * counts, axis=1),
+        sub_totals,
+        out=np.zeros_like(sub_totals, dtype=np.float64),
+        where=sub_totals > 0.0,
+    )
     particle = np.divide(
         satellite * num_halo,
         num_particle,
@@ -129,6 +161,7 @@ def _hod_weights_from_subcenters(
         n_galaxies=n_centrals + n_satellites,
         n_centrals=n_centrals,
         n_satellites=n_satellites,
+        subbin_weighting="halo_count",
     )
 
 
@@ -139,15 +172,18 @@ def refined_hod_bin_weights(
     hod_params: Mapping[str, Any],
     *,
     hod_model: str = "lrg",
-    n_subbins: int = 20,
-    subbin_weighting: str = "uniform_log",
+    mass_subcenters_log10: np.ndarray,
+    num_halo_subbin: np.ndarray,
 ) -> HODBinWeights:
-    """Average HOD occupations over log-uniform subbins inside each mass bin."""
+    """Average HOD occupations over halo-count-weighted subbins inside each mass bin."""
 
-    if subbin_weighting != "uniform_log":
-        raise ValueError("Only subbin_weighting='uniform_log' is currently supported.")
     edges = np.asarray(mass_edges_log10, dtype=np.float64)
-    subcenters = _mass_subcenters_log10(edges, n_subbins)
+    counts = np.asarray(num_halo_subbin, dtype=np.float64)
+    if counts.ndim != 2:
+        raise ValueError(f"num_halo_subbin must be 2D, got shape {counts.shape}.")
+    subcenters = np.asarray(mass_subcenters_log10, dtype=np.float64)
+    if subcenters.shape != counts.shape:
+        raise ValueError(f"mass subbin centers shape {subcenters.shape} does not match counts {counts.shape}.")
     return _hod_weights_from_subcenters(
         edges,
         subcenters,
@@ -155,7 +191,35 @@ def refined_hod_bin_weights(
         num_particle,
         hod_params,
         hod_model=hod_model,
+        num_halo_subbin=counts,
     )
+
+
+def _paircount_subbin_data(paircounts: PairCountTable) -> tuple[np.ndarray, np.ndarray]:
+    if paircounts.num_halo_subbin is None:
+        raise ValueError(
+            "Paircount table is missing mass/num_halo_subbin. Recompute paircounts with the current "
+            "code so HOD subbin refinement can use halo-count weights."
+        )
+    counts = np.asarray(paircounts.num_halo_subbin, dtype=np.float64)
+    if counts.ndim != 2:
+        raise ValueError(f"num_halo_subbin must be 2D, got shape {counts.shape}.")
+    attr_n = paircounts.attrs.get("mass_n_subbins")
+    if attr_n is not None and int(attr_n) != counts.shape[1]:
+        raise ValueError(
+            f"Paircount attr mass_n_subbins={int(attr_n)} does not match mass/num_halo_subbin "
+            f"shape {counts.shape}."
+        )
+    centers = paircounts.mass_subbin_centers_log10
+    if centers is None:
+        raise ValueError(
+            "Paircount table is missing mass/halo_subbin_centers_log10. Recompute paircounts with the "
+            "current code so HOD subbin refinement can use stored halo-count subbins."
+        )
+    centers = np.asarray(centers, dtype=np.float64)
+    if centers.shape != counts.shape:
+        raise ValueError(f"mass subbin centers shape {centers.shape} does not match counts {counts.shape}.")
+    return centers, counts
 
 
 def hod_weights_for_paircounts(
@@ -163,17 +227,18 @@ def hod_weights_for_paircounts(
     hod_params: Mapping[str, Any],
     *,
     hod_model: str = "lrg",
-    n_subbins: int = 20,
 ) -> HODBinWeights:
     """Compute refined HOD weights matching a paircount table's mass bins."""
 
+    subcenters, subcounts = _paircount_subbin_data(paircounts)
     return refined_hod_bin_weights(
         paircounts.mass_edges_log10,
         paircounts.num_halo,
         paircounts.num_particle,
         hod_params,
         hod_model=hod_model,
-        n_subbins=n_subbins,
+        mass_subcenters_log10=subcenters,
+        num_halo_subbin=subcounts,
     )
 
 
@@ -262,13 +327,10 @@ def analytic_random_paircounts(
 class HODClusteringTabulator:
     """In-memory paircount table for repeated HOD evaluations."""
 
-    def __init__(self, paircounts: PairCountTable, *, n_subbins: int = 20):
+    def __init__(self, paircounts: PairCountTable):
         self.paircounts = paircounts
-        self.n_subbins = int(n_subbins)
-        self.mass_subcenters_log10 = _mass_subcenters_log10(
-            paircounts.mass_edges_log10,
-            self.n_subbins,
-        )
+        self.mass_subcenters_log10, self.num_halo_subbin = _paircount_subbin_data(paircounts)
+        self.n_subbins = int(self.num_halo_subbin.shape[1])
         self.bin_shape = tuple(paircounts.counts_hh.shape[2:])
         self.random_geometry = random_geometry_factor(paircounts)
         self._hh = self._flatten_counts(paircounts.counts_hh)
@@ -276,13 +338,8 @@ class HODClusteringTabulator:
         self._pp = self._flatten_counts(paircounts.counts_pp)
 
     @classmethod
-    def from_paircount_file(
-        cls,
-        path: str | Path,
-        *,
-        n_subbins: int = 20,
-    ) -> "HODClusteringTabulator":
-        return cls(read_paircounts(path), n_subbins=n_subbins)
+    def from_paircount_file(cls, path: str | Path) -> "HODClusteringTabulator":
+        return cls(read_paircounts(path))
 
     @staticmethod
     def _flatten_counts(counts: np.ndarray) -> np.ndarray:
@@ -302,6 +359,7 @@ class HODClusteringTabulator:
             self.paircounts.num_particle,
             hod_params,
             hod_model=hod_model,
+            num_halo_subbin=self.num_halo_subbin,
         )
 
     def weighted_paircounts(
@@ -379,11 +437,10 @@ def galaxy_correlation_from_paircounts(
     hod_params: Mapping[str, Any],
     *,
     hod_model: str = "lrg",
-    n_subbins: int = 20,
 ) -> GalaxyClusteringResult:
     """High-level auto-correlation helper returning HOD-weighted ``xi``."""
 
-    tabulator = HODClusteringTabulator.from_paircount_file(paircount_path, n_subbins=n_subbins)
+    tabulator = HODClusteringTabulator.from_paircount_file(paircount_path)
     return tabulator.correlation(hod_params, hod_model=hod_model)
 
 
@@ -394,11 +451,10 @@ def galaxy_cross_correlation_from_paircounts(
     *,
     hod_model_a: str = "lrg",
     hod_model_b: str = "lrg",
-    n_subbins: int = 20,
 ) -> GalaxyClusteringResult:
     """High-level cross-correlation helper for two HOD parameter sets."""
 
-    tabulator = HODClusteringTabulator.from_paircount_file(paircount_path, n_subbins=n_subbins)
+    tabulator = HODClusteringTabulator.from_paircount_file(paircount_path)
     return tabulator.cross_correlation(
         hod_params_a,
         hod_params_b,
@@ -491,6 +547,5 @@ def galaxy_correlation_from_config(
         paircount_path,
         hod_params["params"],
         hod_model=str(hod_params.get("model", "lrg")),
-        n_subbins=int(hod_params.get("n_subbins", 20)),
     )
 

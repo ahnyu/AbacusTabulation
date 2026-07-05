@@ -20,6 +20,7 @@ from .hmf import (
     hod_satellite_median_log10_host_mass,
     hod_satellite_number_density,
     read_hmf,
+    validate_hmf_file_for_config,
 )
 from .linear_bias import HODLinearBiasTabulator, LinearBiasResult, infer_abacus_cosmology_index
 from .paircounts import resolve_paircount_path_from_config
@@ -81,21 +82,17 @@ class HODDerivedTabulator:
                 _fit_tracer_theory_config(config, tracer).get("hod_model", config.get("hod", {}).get("model", "lrg")),
             )
         )
+        linear_config = _merged_mapping(derived_config.get("linear_bias"), tracer_config.get("linear_bias"))
+        if not bool(linear_config.get("enabled", True)):
+            quantities = tuple(item for item in quantities if item not in _LINEAR_BIAS_QUANTITIES)
+
         hmf = None
         if any(item in _HMF_QUANTITIES for item in quantities):
             hmf = read_hmf(_resolve_hmf_path(config, tracer, tracer_config))
 
         linear_bias_tabulator = None
-        linear_config = _merged_mapping(derived_config.get("linear_bias"), tracer_config.get("linear_bias"))
         linear_requested = any(item in _LINEAR_BIAS_QUANTITIES for item in quantities)
-        linear_enabled = linear_requested and bool(linear_config.get("enabled", True))
-        if linear_enabled:
-            n_subbins = int(
-                tracer_config.get(
-                    "n_subbins",
-                    _fit_tracer_theory_config(config, tracer).get("n_subbins", config.get("hod", {}).get("n_subbins", 20)),
-                )
-            )
+        if linear_requested:
             paircount_path = _resolve_linear_bias_paircount_path(config, linear_config)
             sim_params = config.get("sim_params", {})
             cosmology_index = linear_config.get("cosmology_index")
@@ -104,7 +101,6 @@ class HODDerivedTabulator:
             z = float(_first_not_none(linear_config.get("z"), sim_params.get("z_mock"), 0.0))
             linear_bias_tabulator = HODLinearBiasTabulator.from_paircount_file(
                 paircount_path,
-                n_subbins=n_subbins,
                 cosmology_index=int(cosmology_index),
                 z=z,
                 engine=str(linear_config.get("engine", "camb")),
@@ -348,7 +344,13 @@ def _format_sim_output_dir(value: str | Path, config: Mapping[str, Any]) -> Path
 def _resolve_hmf_path(config: Mapping[str, Any], tracer: str, tracer_config: Mapping[str, Any]) -> Path:
     hmf_config = _merged_mapping(config.get("hmf"), tracer_config.get("hmf"))
     if hmf_config.get("path") is not None:
-        return _format_exact_path(hmf_config["path"], config)
+        return validate_hmf_file_for_config(
+            _format_exact_path(hmf_config["path"], config),
+            n_bins=int(hmf_config.get("n_bins", 512)),
+            logm_edges=hmf_config.get("logm_edges"),
+            logm_min=hmf_config.get("logm_min"),
+            logm_max=hmf_config.get("logm_max"),
+        )
     output_value = hmf_config.get("output_dir", hmf_config.get("out_dir"))
     if output_value is None:
         raise KeyError(f"Set hmf.output_dir, hmf.path, or derived.tracers.{tracer}.hmf.path.")
@@ -359,16 +361,19 @@ def _resolve_hmf_path(config: Mapping[str, Any], tracer: str, tracer_config: Map
         file_tag=_first_not_none(hmf_config.get("file_tag"), pair_params.get("file_tag")),
         seed=_first_not_none(hmf_config.get("seed"), pair_params.get("seed"), prepare_params.get("seed")),
         n_bins=int(hmf_config.get("n_bins", 512)),
+        logm_edges=hmf_config.get("logm_edges"),
+        logm_min=hmf_config.get("logm_min"),
+        logm_max=hmf_config.get("logm_max"),
     )
 
 
 def _resolve_linear_bias_paircount_path(config: Mapping[str, Any], linear_config: Mapping[str, Any]) -> Path:
     path = linear_config.get("paircounts_path", linear_config.get("path"))
-    if path is not None:
-        return _format_exact_path(path, config)
     job = str(linear_config.get("paircounts_job", "linear_bias"))
     path_config = dict(linear_config.get("paircounts", {}))
     path_config.setdefault("job", job)
+    if path is not None:
+        path_config["path"] = path
     return resolve_paircount_path_from_config(
         config,
         clustering="smu",

@@ -45,6 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--corrfunc-dtype", help="Optional dtype cast for Corrfunc positions, e.g. f4 or f8.")
 
     parser.add_argument("--nmass-bins", type=int)
+    parser.add_argument("--mass-subbins", type=int, help="Halo-count subbins per mass bin for HOD weighting.")
     parser.add_argument("--logm-min", type=float)
     parser.add_argument("--logm-max", type=float)
     parser.add_argument("--logm-edges", help="Comma-separated log10 mass edges, or path to a text file of edges.")
@@ -88,6 +89,7 @@ def main(argv: list[str] | None = None) -> int:
             hdf5_compression=args.hdf5_compression,
             corrfunc_dtype=args.corrfunc_dtype,
             nmass_bins=args.nmass_bins,
+            mass_n_subbins=args.mass_subbins,
             logm_min=args.logm_min,
             logm_max=args.logm_max,
             logm_edges=args.logm_edges,
@@ -128,6 +130,7 @@ def main(argv: list[str] | None = None) -> int:
             hdf5_compression=args.hdf5_compression,
             corrfunc_dtype=args.corrfunc_dtype,
             nmass_bins=args.nmass_bins if args.nmass_bins is not None else 20,
+            mass_n_subbins=args.mass_subbins if args.mass_subbins is not None else 20,
             logm_min=args.logm_min,
             logm_max=args.logm_max,
             logm_edges=args.logm_edges,

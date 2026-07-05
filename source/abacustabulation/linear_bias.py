@@ -102,7 +102,6 @@ class HODLinearBiasTabulator:
         cls,
         path: str | Path,
         *,
-        n_subbins: int = 20,
         cosmology_index: int,
         z: float,
         engine: str = "camb",
@@ -110,7 +109,7 @@ class HODLinearBiasTabulator:
         fit_s_max: float | None = None,
         positive_only: bool = True,
     ) -> "HODLinearBiasTabulator":
-        tabulator = HODClusteringTabulator.from_paircount_file(path, n_subbins=n_subbins)
+        tabulator = HODClusteringTabulator.from_paircount_file(path)
         return cls(
             tabulator,
             cosmology_index=cosmology_index,
