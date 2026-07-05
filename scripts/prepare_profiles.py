@@ -49,7 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--position-space",
         choices=("real", "rsd", "both"),
-        help="Store real-space positions, RSD positions as pos, or both pos and pos_rsd.",
+        help="Store real-space pos only, or also store RSD positions in pos_rsd.",
     )
     parser.add_argument("--los-axis", help="RSD axis: x, y, z, 0, 1, or 2.")
     parser.add_argument(

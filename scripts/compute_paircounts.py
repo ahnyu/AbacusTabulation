@@ -50,13 +50,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--logm-edges", help="Comma-separated log10 mass edges, or path to a text file of edges.")
 
     parser.add_argument("--nrp-bins", type=int)
-    parser.add_argument("--rp-min", type=float, help="log10 lower rp edge.")
-    parser.add_argument("--rp-max", type=float, help="log10 upper rp edge.")
+    parser.add_argument("--rp-min", type=float, help="Lower rp edge; log10 value when --rp-binning=log10.")
+    parser.add_argument("--rp-max", type=float, help="Upper rp edge; log10 value when --rp-binning=log10.")
+    parser.add_argument("--rp-binning", choices=("log10", "linear"), help="rp binning strategy.")
     parser.add_argument("--pi-max", type=float)
 
     parser.add_argument("--ns-bins", type=int)
-    parser.add_argument("--s-min", type=float, help="log10 lower s edge.")
-    parser.add_argument("--s-max", type=float, help="log10 upper s edge.")
+    parser.add_argument("--s-min", type=float, help="Lower s edge; log10 value when --s-binning=log10.")
+    parser.add_argument("--s-max", type=float, help="Upper s edge; log10 value when --s-binning=log10.")
+    parser.add_argument("--s-binning", choices=("log10", "linear"), help="s binning strategy.")
     parser.add_argument("--mu-max", type=float)
     parser.add_argument("--nmu-bins", type=int)
     return parser
@@ -92,10 +94,12 @@ def main(argv: list[str] | None = None) -> int:
             nrp_bins=args.nrp_bins,
             rp_min=args.rp_min,
             rp_max=args.rp_max,
+            rp_binning=args.rp_binning,
             pi_max=args.pi_max,
             ns_bins=args.ns_bins,
             s_min=args.s_min,
             s_max=args.s_max,
+            s_binning=args.s_binning,
             mu_max=args.mu_max,
             nmu_bins=args.nmu_bins,
         )
@@ -130,10 +134,12 @@ def main(argv: list[str] | None = None) -> int:
             nrp_bins=args.nrp_bins if args.nrp_bins is not None else 18,
             rp_min=args.rp_min if args.rp_min is not None else -1.5,
             rp_max=args.rp_max if args.rp_max is not None else 1.5,
+            rp_binning=args.rp_binning or "log10",
             pi_max=args.pi_max if args.pi_max is not None else 40.0,
             ns_bins=args.ns_bins if args.ns_bins is not None else 18,
             s_min=args.s_min if args.s_min is not None else -1.5,
             s_max=args.s_max if args.s_max is not None else 1.5,
+            s_binning=args.s_binning or "log10",
             mu_max=args.mu_max if args.mu_max is not None else 1.0,
             nmu_bins=args.nmu_bins if args.nmu_bins is not None else 100,
         )

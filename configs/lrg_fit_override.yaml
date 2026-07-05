@@ -14,7 +14,20 @@ paircounts:
   prepared_dir: /cluster/path/prepared
   output_dir: /cluster/path/paircounts
   file_tag: abacustab_profiles_conc-r98-L2com-over-r25-L2com
-  clustering: [rppi]
+
+hmf:
+  prepared_dir: /cluster/path/prepared
+  output_dir: /cluster/path/hmf
+  file_tag: abacustab_profiles_conc-r98-L2com-over-r25-L2com
+  seed: 600
+  n_bins: 512
+
+derived:
+  linear_bias:
+    enabled: true
+    paircounts_job: linear_bias
+    fit_s_min: 10.0
+    fit_s_max: 40.0
 
 hod:
   model: lrg
@@ -42,6 +55,7 @@ fit:
         number_density:
           value: 3.5e-4
           mode: minimum
+          source: hmf
 
   covariance:
     mode: joint
@@ -68,3 +82,9 @@ fit:
   output:
     output_dir: /cluster/path/fit_outputs/{sim_name}/{z}
     prefix: lrg_wp
+
+  postprocess:
+    enabled: false
+    optimization: true
+    mcmc: true
+    fail_on_error: false

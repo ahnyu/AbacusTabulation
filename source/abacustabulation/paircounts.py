@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import h5py
 import numpy as np
@@ -139,6 +139,18 @@ def find_prepared_file_pairs(
     if not pairs:
         suffix = f" with tag {file_tag!r}" if file_tag is not None else ""
         raise FileNotFoundError(f"No prepared files found in {prepared_dir}{suffix}.")
+    tags = sorted({pair.tag for pair in pairs})
+    if file_tag is None and len(tags) > 1:
+        raise ValueError(
+            f"Found prepared files with multiple tags in {prepared_dir}: {tags}. "
+            "Set file_tag to avoid mixing profile/concentration runs."
+        )
+    seeds = sorted({pair.seed for pair in pairs})
+    if seed is None and len(seeds) > 1:
+        raise ValueError(
+            f"Found prepared files with multiple seeds in {prepared_dir}: {seeds}. "
+            "Set seed to avoid mixing prepared catalogs."
+        )
     return sorted(pairs, key=lambda item: item.slab)
 
 
@@ -146,6 +158,30 @@ def _read_required_dataset(group: h5py.Group, name: str, file_path: Path) -> np.
     if name not in group:
         raise KeyError(f"Dataset {name!r} not found in {file_path}.")
     return group[name][...]
+
+
+def _validate_position_dataset_semantics(
+    attrs: Mapping[str, Any],
+    position_dataset: str,
+    file_path: Path,
+) -> None:
+    """Catch legacy prepared files where RSD positions were written into pos."""
+
+    dataset = str(position_dataset)
+    if dataset == "pos":
+        declared = attrs.get("pos_dataset_space")
+        if declared is not None and str(declared).lower() != "real":
+            raise ValueError(f"Dataset 'pos' in {file_path} is declared as {declared!r}, not real.")
+        if declared is None and str(attrs.get("position_space", "")).lower() == "rsd":
+            raise ValueError(
+                f"{file_path} looks like a legacy RSD-only prepared file: position_space='rsd' "
+                "but no pos_dataset_space attr is present. Re-prepare with the current code so "
+                "real-space positions are stored in 'pos' and RSD positions in 'pos_rsd'."
+            )
+    elif dataset == "pos_rsd":
+        declared = attrs.get("pos_rsd_dataset_space")
+        if declared is not None and str(declared).lower() != "rsd":
+            raise ValueError(f"Dataset 'pos_rsd' in {file_path} is declared as {declared!r}, not RSD.")
 
 
 def load_prepared_catalog(
@@ -171,6 +207,7 @@ def load_prepared_catalog(
     for index, pair in enumerate(file_pairs):
         with h5py.File(pair.halo_file, "r") as handle:
             attrs = {key: _decode_attr(value) for key, value in handle.attrs.items()}
+            _validate_position_dataset_semantics(attrs, position_dataset, pair.halo_file)
             group = handle["halos"]
             halo_pos = _read_required_dataset(group, position_dataset, pair.halo_file)
             halo_n = _read_required_dataset(group, "N", pair.halo_file).astype(np.float64)
@@ -371,6 +408,7 @@ def load_prepared_binned_catalog(
     for index, pair in enumerate(file_pairs):
         with h5py.File(pair.halo_file, "r") as handle:
             attrs = {key: _decode_attr(value) for key, value in handle.attrs.items()}
+            _validate_position_dataset_semantics(attrs, position_dataset, pair.halo_file)
             slab_mpart = float(attrs.get("Mpart", attrs.get("ParticleMassHMsun")))
             slab_lbox = float(attrs.get("Lbox", attrs.get("BoxSizeHMpc")))
             if index == 0:
@@ -608,6 +646,8 @@ def _corrfunc_smu(
 def _catalog_output_attrs(catalog: PreparedCatalog | BinnedPreparedCatalog) -> dict[str, Any]:
     keys = (
         "position_dataset",
+        "pos_dataset_space",
+        "pos_rsd_dataset_space",
         "corrfunc_position_wrap",
         "prepared_tags",
         "prepared_seeds",
@@ -695,6 +735,7 @@ def compute_rppi_paircounts(
     boxsize: float | None = None,
     overwrite: bool = False,
     compression: str | None = None,
+    rp_binning: str = "custom",
 ) -> Path:
     """Compute HH, HP, and PP pair counts in mass bins for rp-pi bins."""
 
@@ -718,6 +759,7 @@ def compute_rppi_paircounts(
         "n_particles": n_particles,
         "n_mass_bins": nmass,
         "pi_max": float(pi_max),
+        "rp_binning": str(rp_binning),
         "schema_version": "paircounts_v1",
     }
     handle, hh_ds, hp_ds, pp_ds = _create_output_file(
@@ -808,6 +850,7 @@ def compute_smu_paircounts(
     boxsize: float | None = None,
     overwrite: bool = False,
     compression: str | None = None,
+    s_binning: str = "custom",
 ) -> Path:
     """Compute HH, HP, and PP pair counts in mass bins for s-mu bins."""
 
@@ -829,6 +872,7 @@ def compute_smu_paircounts(
         "n_mass_bins": nmass,
         "mu_max": float(mu_max),
         "nmu_bins": int(nmu_bins),
+        "s_binning": str(s_binning),
         "schema_version": "paircounts_v1",
     }
     handle, hh_ds, hp_ds, pp_ds = _create_output_file(
@@ -921,10 +965,72 @@ def default_output_path(
     position_dataset: str,
     file_tag: str | None,
     nmass_bins: int,
+    job_name: str | None = None,
 ) -> Path:
     tag = _sanitize_filename_piece(file_tag or "prepared")
     pos = _sanitize_filename_piece(position_dataset)
-    return Path(output_dir) / f"paircounts_{clustering}_{pos}_{tag}_m{nmass_bins}.h5"
+    pieces = ["paircounts"]
+    if job_name is not None:
+        pieces.append(_sanitize_filename_piece(job_name))
+    pieces.extend([str(clustering), pos, tag, f"m{int(nmass_bins)}"])
+    return Path(output_dir) / ("_".join(pieces) + ".h5")
+
+
+def find_paircount_file(
+    output_dir: str | Path,
+    *,
+    clustering: str,
+    position_dataset: str,
+    file_tag: str | None = None,
+    nmass_bins: int = 20,
+    job_name: str | None = None,
+) -> Path:
+    """Find one paircount file matching the config-derived naming convention."""
+
+    output_dir = Path(output_dir)
+    if file_tag is not None:
+        path = default_output_path(
+            output_dir,
+            clustering=clustering,
+            position_dataset=position_dataset,
+            file_tag=file_tag,
+            nmass_bins=nmass_bins,
+            job_name=job_name,
+        )
+        if path.exists():
+            return path
+        if job_name is not None:
+            legacy = default_output_path(
+                output_dir,
+                clustering=clustering,
+                position_dataset=position_dataset,
+                file_tag=file_tag,
+                nmass_bins=nmass_bins,
+                job_name=None,
+            )
+            if legacy.exists():
+                return legacy
+        raise FileNotFoundError(path)
+
+    pos = _sanitize_filename_piece(position_dataset)
+    prefix = "paircounts"
+    if job_name is not None:
+        prefix += "_" + _sanitize_filename_piece(job_name)
+    pattern = f"{prefix}_{clustering}_{pos}_*_m{int(nmass_bins)}.h5"
+    matches = sorted(output_dir.glob(pattern))
+    if len(matches) == 1:
+        return matches[0]
+    if not matches and job_name is not None:
+        legacy_pattern = f"paircounts_{clustering}_{pos}_*_m{int(nmass_bins)}.h5"
+        matches = sorted(output_dir.glob(legacy_pattern))
+        pattern = f"{pattern} or {legacy_pattern}"
+        if len(matches) == 1:
+            return matches[0]
+    if not matches:
+        raise FileNotFoundError(f"No paircount file matching {pattern} in {output_dir}.")
+    raise ValueError(
+        f"Found multiple paircount files matching {pattern} in {output_dir}; set file_tag."
+    )
 
 
 def _first_not_none(*values: Any) -> Any:
@@ -958,6 +1064,16 @@ def _format_config_path(value: str | Path, *, sim_name: str, z_mock: float) -> P
     return path / sim_name / z_dir
 
 
+def _format_exact_path(value: str | Path, *, sim_name: str, z_mock: float) -> Path:
+    return Path(
+        str(value).format(
+            sim_name=sim_name,
+            z=_z_directory(z_mock),
+            z_mock=float(z_mock),
+        )
+    )
+
+
 def normalize_clustering_modes(value: object | None) -> list[str]:
     """Normalize a clustering mode config value to a list of modes."""
 
@@ -973,6 +1089,404 @@ def normalize_clustering_modes(value: object | None) -> list[str]:
     if unknown:
         raise ValueError(f"Unknown clustering mode(s): {unknown}")
     return modes
+
+
+def normalize_radial_binning(value: object | None) -> str:
+    """Normalize radial binning names."""
+
+    if value is None:
+        return "log10"
+    mode = str(value).strip().lower()
+    if mode in {"log", "log10", "logspace"}:
+        return "log10"
+    if mode in {"lin", "linear", "linspace"}:
+        return "linear"
+    raise ValueError("Radial binning must be 'log10' or 'linear'.")
+
+
+def radial_bin_edges(
+    n_bins: int,
+    lower: float,
+    upper: float,
+    *,
+    binning: str = "log10",
+) -> np.ndarray:
+    """Build radial bin edges for either log10 or linear spacing."""
+
+    n_bins = int(n_bins)
+    if n_bins <= 0:
+        raise ValueError("n_bins must be positive.")
+    lower = float(lower)
+    upper = float(upper)
+    if upper <= lower:
+        raise ValueError("Radial upper edge must be greater than lower edge.")
+    mode = normalize_radial_binning(binning)
+    if mode == "log10":
+        return np.logspace(lower, upper, n_bins + 1)
+    if lower <= 0.0:
+        raise ValueError("Linear radial bins require a positive lower edge in Mpc/h.")
+    return np.linspace(lower, upper, n_bins + 1)
+
+
+def _merged_mapping(base: Mapping[str, Any] | None, override: Mapping[str, Any] | None) -> dict[str, Any]:
+    out = dict(base or {})
+    out.update(dict(override or {}))
+    return out
+
+
+def _resolve_prepared_path(
+    *,
+    sim_name: str,
+    z_mock: float,
+    pair_params: Mapping[str, Any],
+    job_params: Mapping[str, Any],
+    prepare_params: Mapping[str, Any],
+    paths_params: Mapping[str, Any],
+    prepared_dir: str | Path | None,
+) -> Path:
+    prepared_value = _first_not_none(
+        prepared_dir,
+        job_params.get("prepared_dir"),
+        pair_params.get("prepared_dir"),
+        paths_params.get("prepared_dir"),
+        prepare_params.get("out_dir"),
+        prepare_params.get("output_dir"),
+    )
+    if prepared_value is None:
+        output_root = pair_params.get("output_root", prepare_params.get("output_root"))
+        if output_root is None:
+            raise KeyError(
+                "Set paircounts.prepared_dir, prepare_profiles.out_dir, or prepare_profiles.output_dir."
+            )
+        return Path(output_root) / sim_name / _z_directory(z_mock)
+    return _format_config_path(prepared_value, sim_name=sim_name, z_mock=z_mock)
+
+
+def _resolve_output_path(
+    *,
+    sim_name: str,
+    z_mock: float,
+    pair_params: Mapping[str, Any],
+    job_params: Mapping[str, Any],
+    paths_params: Mapping[str, Any],
+    output_dir: str | Path | None,
+    job_name: str | None,
+    append_job_dir: bool,
+) -> Path:
+    output_value = _first_not_none(
+        output_dir,
+        job_params.get("output_dir"),
+        pair_params.get("output_dir"),
+        paths_params.get("paircounts_dir"),
+    )
+    if output_value is None:
+        raise KeyError("Set paircounts.output_dir or paircounts.jobs.<name>.output_dir.")
+    output_path = _format_config_path(output_value, sim_name=sim_name, z_mock=z_mock)
+    if append_job_dir and job_name is not None and job_params.get("output_dir") is None:
+        output_path = output_path / _sanitize_filename_piece(job_name)
+    return output_path
+
+
+def _compute_config_job(
+    *,
+    sim_name: str,
+    z_mock: float,
+    pair_params: Mapping[str, Any],
+    job_name: str | None,
+    job_params: Mapping[str, Any],
+    prepare_params: Mapping[str, Any],
+    paths_params: Mapping[str, Any],
+    append_job_dir: bool,
+    catalog_cache: dict[tuple[Any, ...], tuple[BinnedPreparedCatalog, MassTabulation]] | None,
+    prepared_dir: str | Path | None,
+    output_dir: str | Path | None,
+    file_tag: str | None,
+    seed: int | None,
+    position_dataset: str | None,
+    clustering: object | None,
+    nthreads: int | None,
+    boxsize: float | None,
+    overwrite: bool | None,
+    hdf5_compression: str | None,
+    corrfunc_dtype: str | np.dtype | None,
+    nmass_bins: int | None,
+    logm_min: float | None,
+    logm_max: float | None,
+    logm_edges: object | None,
+    nrp_bins: int | None,
+    rp_min: float | None,
+    rp_max: float | None,
+    rp_binning: str | None,
+    pi_max: float | None,
+    ns_bins: int | None,
+    s_min: float | None,
+    s_max: float | None,
+    s_binning: str | None,
+    mu_max: float | None,
+    nmu_bins: int | None,
+) -> list[Path]:
+    mass_params = _merged_mapping(pair_params.get("mass"), job_params.get("mass"))
+    rppi_params = _merged_mapping(pair_params.get("rppi"), job_params.get("rppi"))
+    smu_params = _merged_mapping(pair_params.get("smu"), job_params.get("smu"))
+
+    prepared_path = _resolve_prepared_path(
+        sim_name=sim_name,
+        z_mock=z_mock,
+        pair_params=pair_params,
+        job_params=job_params,
+        prepare_params=prepare_params,
+        paths_params=paths_params,
+        prepared_dir=prepared_dir,
+    )
+    output_path = _resolve_output_path(
+        sim_name=sim_name,
+        z_mock=z_mock,
+        pair_params=pair_params,
+        job_params=job_params,
+        paths_params=paths_params,
+        output_dir=output_dir,
+        job_name=job_name,
+        append_job_dir=append_job_dir,
+    )
+    effective_position_dataset = str(
+        _first_not_none(position_dataset, job_params.get("position_dataset"), pair_params.get("position_dataset"), "pos")
+    )
+    effective_clustering = _first_not_none(clustering, job_params.get("clustering"), pair_params.get("clustering"), "rppi")
+    _validate_paircount_job(job_name, effective_position_dataset, effective_clustering)
+
+    effective_file_tag = _first_not_none(file_tag, job_params.get("file_tag"), pair_params.get("file_tag"))
+    effective_seed = _first_not_none(seed, job_params.get("seed"), pair_params.get("seed"), prepare_params.get("seed"))
+    effective_corrfunc_dtype = _first_not_none(corrfunc_dtype, job_params.get("corrfunc_dtype"), pair_params.get("corrfunc_dtype"))
+    effective_nmass_bins = int(_first_not_none(nmass_bins, mass_params.get("nmass_bins"), pair_params.get("nmass_bins"), 20))
+    effective_logm_min = _first_not_none(logm_min, mass_params.get("logm_min"), pair_params.get("logm_min"))
+    effective_logm_max = _first_not_none(logm_max, mass_params.get("logm_max"), pair_params.get("logm_max"))
+    effective_logm_edges = _first_not_none(logm_edges, mass_params.get("logm_edges"), pair_params.get("logm_edges"))
+    effective_hdf5_compression = _first_not_none(
+        hdf5_compression,
+        job_params.get("hdf5_compression"),
+        job_params.get("compression"),
+        pair_params.get("hdf5_compression"),
+        pair_params.get("compression"),
+    )
+
+    catalog, mass_tab = _load_cached_binned_catalog(
+        catalog_cache,
+        prepared_dir=prepared_path,
+        file_tag=effective_file_tag,
+        seed=effective_seed,
+        position_dataset=effective_position_dataset,
+        corrfunc_dtype=effective_corrfunc_dtype,
+        nmass_bins=effective_nmass_bins,
+        logm_min=effective_logm_min,
+        logm_max=effective_logm_max,
+        logm_edges=effective_logm_edges,
+    )
+    return compute_paircounts_for_binned_catalog(
+        catalog,
+        mass_tab,
+        output_dir=output_path,
+        job_name=job_name if append_job_dir else None,
+        file_tag=effective_file_tag,
+        position_dataset=effective_position_dataset,
+        clustering=effective_clustering,
+        nthreads=int(_first_not_none(nthreads, job_params.get("nthreads"), pair_params.get("nthreads"), 32)),
+        boxsize=_first_not_none(boxsize, job_params.get("boxsize"), pair_params.get("boxsize")),
+        overwrite=bool(_first_not_none(overwrite, job_params.get("overwrite"), pair_params.get("overwrite"), False)),
+        hdf5_compression=effective_hdf5_compression,
+        nrp_bins=int(_first_not_none(nrp_bins, rppi_params.get("nrp_bins"), pair_params.get("nrp_bins"), 18)),
+        rp_min=float(_first_not_none(rp_min, rppi_params.get("rp_min"), pair_params.get("rp_min"), -1.5)),
+        rp_max=float(_first_not_none(rp_max, rppi_params.get("rp_max"), pair_params.get("rp_max"), 1.5)),
+        rp_binning=normalize_radial_binning(_first_not_none(rp_binning, rppi_params.get("rp_binning"), pair_params.get("rp_binning"), "log10")),
+        pi_max=float(_first_not_none(pi_max, rppi_params.get("pi_max"), pair_params.get("pi_max"), 40.0)),
+        ns_bins=int(_first_not_none(ns_bins, smu_params.get("ns_bins"), pair_params.get("ns_bins"), 18)),
+        s_min=float(_first_not_none(s_min, smu_params.get("s_min"), pair_params.get("s_min"), -1.5)),
+        s_max=float(_first_not_none(s_max, smu_params.get("s_max"), pair_params.get("s_max"), 1.5)),
+        s_binning=normalize_radial_binning(_first_not_none(s_binning, smu_params.get("s_binning"), pair_params.get("s_binning"), "log10")),
+        mu_max=float(_first_not_none(mu_max, smu_params.get("mu_max"), pair_params.get("mu_max"), 1.0)),
+        nmu_bins=int(_first_not_none(nmu_bins, smu_params.get("nmu_bins"), pair_params.get("nmu_bins"), 100)),
+    )
+
+
+def _validate_paircount_job(
+    job_name: str | None,
+    position_dataset: str,
+    clustering: object | None,
+) -> None:
+    if str(job_name or "") != "linear_bias":
+        return
+    modes = normalize_clustering_modes(clustering)
+    if modes != ["smu"]:
+        raise ValueError("paircounts.jobs.linear_bias must set clustering: [smu].")
+    if str(position_dataset) != "pos":
+        raise ValueError("paircounts.jobs.linear_bias must use real-space position_dataset: pos.")
+
+
+def _cache_piece(value: Any) -> str:
+    return repr(value)
+
+
+def _binned_catalog_cache_key(
+    *,
+    prepared_dir: str | Path,
+    file_tag: str | None,
+    seed: int | None,
+    position_dataset: str,
+    corrfunc_dtype: str | np.dtype | None,
+    nmass_bins: int,
+    logm_min: float | None,
+    logm_max: float | None,
+    logm_edges: object | None,
+) -> tuple[Any, ...]:
+    return (
+        str(Path(prepared_dir)),
+        file_tag,
+        None if seed is None else int(seed),
+        str(position_dataset),
+        None if corrfunc_dtype is None else str(np.dtype(corrfunc_dtype)),
+        int(nmass_bins),
+        None if logm_min is None else float(logm_min),
+        None if logm_max is None else float(logm_max),
+        _cache_piece(logm_edges),
+    )
+
+
+def _load_cached_binned_catalog(
+    cache: dict[tuple[Any, ...], tuple[BinnedPreparedCatalog, MassTabulation]] | None,
+    *,
+    prepared_dir: str | Path,
+    file_tag: str | None,
+    seed: int | None,
+    position_dataset: str,
+    corrfunc_dtype: str | np.dtype | None,
+    nmass_bins: int,
+    logm_min: float | None,
+    logm_max: float | None,
+    logm_edges: object | None,
+) -> tuple[BinnedPreparedCatalog, MassTabulation]:
+    key = _binned_catalog_cache_key(
+        prepared_dir=prepared_dir,
+        file_tag=file_tag,
+        seed=seed,
+        position_dataset=position_dataset,
+        corrfunc_dtype=corrfunc_dtype,
+        nmass_bins=nmass_bins,
+        logm_min=logm_min,
+        logm_max=logm_max,
+        logm_edges=logm_edges,
+    )
+    if cache is not None and key in cache:
+        print("reusing prepared catalog mass bins", flush=True)
+        return cache[key]
+
+    print("loading prepared catalog into mass bins", flush=True)
+    catalog, mass_tab = load_prepared_binned_catalog(
+        prepared_dir,
+        file_tag=file_tag,
+        seed=seed,
+        position_dataset=position_dataset,
+        dtype=corrfunc_dtype,
+        nmass_bins=int(nmass_bins),
+        logm_min=logm_min,
+        logm_max=logm_max,
+        logm_edges=logm_edges,
+    )
+    print(
+        f"loaded halos={catalog.n_halos:,} particles={catalog.n_particles:,} "
+        f"slabs={len(catalog.files):,}",
+        flush=True,
+    )
+    print("mass-bin halo counts:", mass_tab.num_halo, flush=True)
+    print("mass-bin particle counts:", mass_tab.num_particle, flush=True)
+    if cache is not None:
+        cache[key] = (catalog, mass_tab)
+    return catalog, mass_tab
+
+
+def compute_paircounts_for_binned_catalog(
+    catalog: BinnedPreparedCatalog,
+    mass_tab: MassTabulation,
+    *,
+    output_dir: str | Path,
+    file_tag: str | None = None,
+    position_dataset: str | None = None,
+    clustering: object | None = None,
+    nthreads: int = 32,
+    boxsize: float | None = None,
+    overwrite: bool = False,
+    hdf5_compression: str | None = None,
+    nrp_bins: int = 18,
+    rp_min: float = -1.5,
+    rp_max: float = 1.5,
+    rp_binning: str = "log10",
+    pi_max: float = 40.0,
+    ns_bins: int = 18,
+    s_min: float = -1.5,
+    s_max: float = 1.5,
+    s_binning: str = "log10",
+    mu_max: float = 1.0,
+    nmu_bins: int = 100,
+    job_name: str | None = None,
+) -> list[Path]:
+    """Compute requested paircounts from an already loaded binned catalog."""
+
+    modes = normalize_clustering_modes(clustering)
+    output_dir = Path(output_dir)
+    position_dataset = str(position_dataset or catalog.attrs.get("position_dataset", "pos"))
+    unique_tags = sorted({item.tag for item in catalog.files})
+    output_tag = file_tag or (unique_tags[0] if len(unique_tags) == 1 else "prepared")
+    outputs: list[Path] = []
+
+    if "rppi" in modes:
+        rp_binning = normalize_radial_binning(rp_binning)
+        rp_edges = radial_bin_edges(int(nrp_bins), float(rp_min), float(rp_max), binning=rp_binning)
+        outputs.append(
+            compute_rppi_paircounts(
+                catalog,
+                mass_tab,
+                default_output_path(
+                    output_dir,
+                    clustering="rppi",
+                    position_dataset=position_dataset,
+                    file_tag=output_tag,
+                    nmass_bins=len(mass_tab.num_halo),
+                    job_name=job_name,
+                ),
+                rp_edges=rp_edges,
+                pi_max=float(pi_max),
+                nthreads=int(nthreads),
+                boxsize=boxsize,
+                overwrite=bool(overwrite),
+                compression=hdf5_compression,
+                rp_binning=rp_binning,
+            )
+        )
+
+    if "smu" in modes:
+        s_binning = normalize_radial_binning(s_binning)
+        s_edges = radial_bin_edges(int(ns_bins), float(s_min), float(s_max), binning=s_binning)
+        outputs.append(
+            compute_smu_paircounts(
+                catalog,
+                mass_tab,
+                default_output_path(
+                    output_dir,
+                    clustering="smu",
+                    position_dataset=position_dataset,
+                    file_tag=output_tag,
+                    nmass_bins=len(mass_tab.num_halo),
+                    job_name=job_name,
+                ),
+                s_edges=s_edges,
+                mu_max=float(mu_max),
+                nmu_bins=int(nmu_bins),
+                nthreads=int(nthreads),
+                boxsize=boxsize,
+                overwrite=bool(overwrite),
+                compression=hdf5_compression,
+                s_binning=s_binning,
+            )
+        )
+    return outputs
 
 
 def compute_paircounts_from_prepared(
@@ -995,87 +1509,54 @@ def compute_paircounts_from_prepared(
     nrp_bins: int = 18,
     rp_min: float = -1.5,
     rp_max: float = 1.5,
+    rp_binning: str = "log10",
     pi_max: float = 40.0,
     ns_bins: int = 18,
     s_min: float = -1.5,
     s_max: float = 1.5,
+    s_binning: str = "log10",
     mu_max: float = 1.0,
     nmu_bins: int = 100,
+    job_name: str | None = None,
 ) -> list[Path]:
     """Load prepared catalogs, build mass bins, and compute requested paircounts."""
 
-    modes = normalize_clustering_modes(clustering)
-    print("loading prepared catalog into mass bins", flush=True)
-    catalog, mass_tab = load_prepared_binned_catalog(
-        prepared_dir,
+    catalog, mass_tab = _load_cached_binned_catalog(
+        None,
+        prepared_dir=prepared_dir,
         file_tag=file_tag,
         seed=seed,
         position_dataset=position_dataset,
-        dtype=corrfunc_dtype,
+        corrfunc_dtype=corrfunc_dtype,
         nmass_bins=int(nmass_bins),
         logm_min=logm_min,
         logm_max=logm_max,
         logm_edges=logm_edges,
     )
-    print(
-        f"loaded halos={catalog.n_halos:,} particles={catalog.n_particles:,} "
-        f"slabs={len(catalog.files):,}",
-        flush=True,
+    return compute_paircounts_for_binned_catalog(
+        catalog,
+        mass_tab,
+        output_dir=output_dir,
+        file_tag=file_tag,
+        position_dataset=position_dataset,
+        clustering=clustering,
+        nthreads=nthreads,
+        boxsize=boxsize,
+        overwrite=overwrite,
+        hdf5_compression=hdf5_compression,
+        nrp_bins=nrp_bins,
+        rp_min=rp_min,
+        rp_max=rp_max,
+        rp_binning=rp_binning,
+        pi_max=pi_max,
+        ns_bins=ns_bins,
+        s_min=s_min,
+        s_max=s_max,
+        s_binning=s_binning,
+        mu_max=mu_max,
+        nmu_bins=nmu_bins,
+        job_name=job_name,
     )
-    print("mass-bin halo counts:", mass_tab.num_halo, flush=True)
-    print("mass-bin particle counts:", mass_tab.num_particle, flush=True)
-
-    output_dir = Path(output_dir)
-    unique_tags = sorted({item.tag for item in catalog.files})
-    output_tag = file_tag or (unique_tags[0] if len(unique_tags) == 1 else "prepared")
-    outputs: list[Path] = []
-
-    if "rppi" in modes:
-        rp_edges = np.logspace(float(rp_min), float(rp_max), int(nrp_bins) + 1)
-        outputs.append(
-            compute_rppi_paircounts(
-                catalog,
-                mass_tab,
-                default_output_path(
-                    output_dir,
-                    clustering="rppi",
-                    position_dataset=position_dataset,
-                    file_tag=output_tag,
-                    nmass_bins=len(mass_tab.num_halo),
-                ),
-                rp_edges=rp_edges,
-                pi_max=float(pi_max),
-                nthreads=int(nthreads),
-                boxsize=boxsize,
-                overwrite=bool(overwrite),
-                compression=hdf5_compression,
-            )
-        )
-
-    if "smu" in modes:
-        s_edges = np.logspace(float(s_min), float(s_max), int(ns_bins) + 1)
-        outputs.append(
-            compute_smu_paircounts(
-                catalog,
-                mass_tab,
-                default_output_path(
-                    output_dir,
-                    clustering="smu",
-                    position_dataset=position_dataset,
-                    file_tag=output_tag,
-                    nmass_bins=len(mass_tab.num_halo),
-                ),
-                s_edges=s_edges,
-                mu_max=float(mu_max),
-                nmu_bins=int(nmu_bins),
-                nthreads=int(nthreads),
-                boxsize=boxsize,
-                overwrite=bool(overwrite),
-                compression=hdf5_compression,
-            )
-        )
-    return outputs
-
 
 def paircounts_from_config(
     path2config: str | Path,
@@ -1098,10 +1579,12 @@ def paircounts_from_config(
     nrp_bins: int | None = None,
     rp_min: float | None = None,
     rp_max: float | None = None,
+    rp_binning: str | None = None,
     pi_max: float | None = None,
     ns_bins: int | None = None,
     s_min: float | None = None,
     s_max: float | None = None,
+    s_binning: str | None = None,
     mu_max: float | None = None,
     nmu_bins: int | None = None,
 ) -> list[Path]:
@@ -1110,75 +1593,149 @@ def paircounts_from_config(
     from .config import load_config
 
     config = load_config(path2config)
-
     sim_params = config.get("sim_params", {})
     paths_params = config.get("paths", {})
     prepare_params = config.get("prepare_profiles", {})
     pair_params = config.get("paircounts", {})
-    mass_params = pair_params.get("mass", {})
-    rppi_params = pair_params.get("rppi", {})
-    smu_params = pair_params.get("smu", {})
 
     sim_name = str(sim_params.get("sim_name", ""))
     z_mock = float(sim_params.get("z_mock", 0.0))
-
-    prepared_value = _first_not_none(
-        prepared_dir,
-        pair_params.get("prepared_dir"),
-        paths_params.get("prepared_dir"),
-        prepare_params.get("out_dir"),
-        prepare_params.get("output_dir"),
+    common = dict(
+        sim_name=sim_name,
+        z_mock=z_mock,
+        pair_params=pair_params,
+        prepare_params=prepare_params,
+        paths_params=paths_params,
+        prepared_dir=prepared_dir,
+        output_dir=output_dir,
+        file_tag=file_tag,
+        seed=seed,
+        position_dataset=position_dataset,
+        clustering=clustering,
+        nthreads=nthreads,
+        boxsize=boxsize,
+        overwrite=overwrite,
+        hdf5_compression=hdf5_compression,
+        corrfunc_dtype=corrfunc_dtype,
+        nmass_bins=nmass_bins,
+        logm_min=logm_min,
+        logm_max=logm_max,
+        logm_edges=logm_edges,
+        nrp_bins=nrp_bins,
+        rp_min=rp_min,
+        rp_max=rp_max,
+        rp_binning=rp_binning,
+        pi_max=pi_max,
+        ns_bins=ns_bins,
+        s_min=s_min,
+        s_max=s_max,
+        s_binning=s_binning,
+        mu_max=mu_max,
+        nmu_bins=nmu_bins,
     )
-    if prepared_value is None:
-        output_root = sim_params.get("subsample_dir", prepare_params.get("output_root"))
-        if output_root is None:
-            raise KeyError(
-                "Set paircounts.prepared_dir, paths.prepared_dir, "
-                "prepare_profiles.out_dir, prepare_profiles.output_dir, or sim_params.subsample_dir."
+
+    jobs = pair_params.get("jobs")
+    if jobs:
+        if not isinstance(jobs, Mapping):
+            raise ValueError("paircounts.jobs must be a mapping from job name to config.")
+        outputs: list[Path] = []
+        catalog_cache: dict[tuple[Any, ...], tuple[BinnedPreparedCatalog, MassTabulation]] = {}
+        for job_name, raw_job_params in jobs.items():
+            job_params = dict(raw_job_params or {})
+            if not bool(job_params.get("enabled", True)):
+                continue
+            outputs.extend(
+                _compute_config_job(
+                    **common,
+                    job_name=str(job_name),
+                    job_params=job_params,
+                    append_job_dir=True,
+                    catalog_cache=catalog_cache,
+                )
             )
-        prepared_path = Path(output_root) / sim_name / _z_directory(z_mock)
-    else:
-        prepared_path = _format_config_path(prepared_value, sim_name=sim_name, z_mock=z_mock)
+        if not outputs:
+            raise ValueError("paircounts.jobs is set, but no jobs are enabled.")
+        return outputs
 
-    output_value = _first_not_none(
-        output_dir,
-        pair_params.get("output_dir"),
-        paths_params.get("paircounts_dir"),
+    return _compute_config_job(
+        **common,
+        job_name=None,
+        job_params={},
+        append_job_dir=False,
+        catalog_cache=None,
     )
+
+
+def resolve_paircount_path_from_config(
+    config: Mapping[str, Any],
+    *,
+    clustering: str,
+    path_config: Mapping[str, Any] | None = None,
+    job_name: str | None = None,
+) -> Path:
+    """Resolve a paircount file path from config, including named jobs."""
+
+    path_config = dict(path_config or {})
+    if path_config.get("path") is not None:
+        sim_params = config.get("sim_params", {})
+        return _format_exact_path(
+            path_config["path"],
+            sim_name=str(sim_params.get("sim_name", "")),
+            z_mock=float(sim_params.get("z_mock", 0.0)),
+        )
+
+    pair_params = config.get("paircounts", {})
+    paths_params = config.get("paths", {})
+    sim_params = config.get("sim_params", {})
+    sim_name = str(sim_params.get("sim_name", ""))
+    z_mock = float(sim_params.get("z_mock", 0.0))
+    jobs = pair_params.get("jobs") or {}
+    selected_job = path_config.get("job", job_name)
+    if selected_job is None and jobs:
+        selected_job = "clustering"
+    selected_job = None if selected_job is None else str(selected_job)
+    job_params = dict(jobs.get(selected_job, {}) if selected_job is not None else {})
+
+    mass_params = _merged_mapping(pair_params.get("mass"), job_params.get("mass"))
+    output_value = path_config.get(
+        "dir",
+        path_config.get("paircounts_dir", path_config.get("output_dir")),
+    )
+    append_job = bool(jobs and selected_job is not None and output_value is None and job_params.get("output_dir") is None)
     if output_value is None:
-        raise KeyError("Set paircounts.output_dir or paths.paircounts_dir.")
-    output_path = _format_config_path(output_value, sim_name=sim_name, z_mock=z_mock)
+        output_value = _first_not_none(job_params.get("output_dir"), pair_params.get("output_dir"), paths_params.get("paircounts_dir"))
+    if output_value is None:
+        raise KeyError("Set paircounts.output_dir or an explicit paircount path.")
+    output_dir = _format_config_path(output_value, sim_name=sim_name, z_mock=z_mock)
+    if append_job:
+        output_dir = output_dir / _sanitize_filename_piece(selected_job)
 
-    return compute_paircounts_from_prepared(
-        prepared_dir=prepared_path,
-        output_dir=output_path,
-        file_tag=_first_not_none(file_tag, pair_params.get("file_tag")),
-        seed=_first_not_none(seed, pair_params.get("seed"), prepare_params.get("seed")),
-        position_dataset=str(
-            _first_not_none(position_dataset, pair_params.get("position_dataset"), "pos")
-        ),
-        clustering=_first_not_none(clustering, pair_params.get("clustering"), "rppi"),
-        nthreads=int(_first_not_none(nthreads, pair_params.get("nthreads"), 32)),
-        boxsize=_first_not_none(boxsize, pair_params.get("boxsize")),
-        overwrite=bool(_first_not_none(overwrite, pair_params.get("overwrite"), False)),
-        hdf5_compression=_first_not_none(
-            hdf5_compression,
-            pair_params.get("hdf5_compression"),
-            pair_params.get("compression"),
-        ),
-        corrfunc_dtype=_first_not_none(corrfunc_dtype, pair_params.get("corrfunc_dtype")),
-        nmass_bins=int(_first_not_none(nmass_bins, mass_params.get("nmass_bins"), pair_params.get("nmass_bins"), 20)),
-        logm_min=_first_not_none(logm_min, mass_params.get("logm_min"), pair_params.get("logm_min")),
-        logm_max=_first_not_none(logm_max, mass_params.get("logm_max"), pair_params.get("logm_max")),
-        logm_edges=_first_not_none(logm_edges, mass_params.get("logm_edges"), pair_params.get("logm_edges")),
-        nrp_bins=int(_first_not_none(nrp_bins, rppi_params.get("nrp_bins"), pair_params.get("nrp_bins"), 18)),
-        rp_min=float(_first_not_none(rp_min, rppi_params.get("rp_min"), pair_params.get("rp_min"), -1.5)),
-        rp_max=float(_first_not_none(rp_max, rppi_params.get("rp_max"), pair_params.get("rp_max"), 1.5)),
-        pi_max=float(_first_not_none(pi_max, rppi_params.get("pi_max"), pair_params.get("pi_max"), 40.0)),
-        ns_bins=int(_first_not_none(ns_bins, smu_params.get("ns_bins"), pair_params.get("ns_bins"), 18)),
-        s_min=float(_first_not_none(s_min, smu_params.get("s_min"), pair_params.get("s_min"), -1.5)),
-        s_max=float(_first_not_none(s_max, smu_params.get("s_max"), pair_params.get("s_max"), 1.5)),
-        mu_max=float(_first_not_none(mu_max, smu_params.get("mu_max"), pair_params.get("mu_max"), 1.0)),
-        nmu_bins=int(_first_not_none(nmu_bins, smu_params.get("nmu_bins"), pair_params.get("nmu_bins"), 100)),
+    position_dataset = str(
+        _first_not_none(
+            path_config.get("position_dataset"),
+            job_params.get("position_dataset"),
+            pair_params.get("position_dataset"),
+            "pos",
+        )
     )
-
+    file_tag = _first_not_none(
+        path_config.get("file_tag"),
+        job_params.get("file_tag"),
+        pair_params.get("file_tag"),
+    )
+    nmass_bins = int(
+        _first_not_none(
+            path_config.get("nmass_bins"),
+            mass_params.get("nmass_bins"),
+            pair_params.get("nmass_bins"),
+            20,
+        )
+    )
+    return find_paircount_file(
+        output_dir,
+        clustering=clustering,
+        position_dataset=position_dataset,
+        file_tag=file_tag,
+        nmass_bins=nmass_bins,
+        job_name=selected_job if jobs else None,
+    )

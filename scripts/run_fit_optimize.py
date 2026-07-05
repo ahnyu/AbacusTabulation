@@ -47,6 +47,11 @@ def _output_settings(problem, args) -> tuple[Path, str]:
     return output_dir, prefix
 
 
+def _postprocess_fail_on_error(problem) -> bool:
+    post = problem.fit_config.get("postprocess", {})
+    return bool(post.get("fail_on_error", post.get("fail_on_postprocess_error", False)))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -106,7 +111,26 @@ def main(argv: list[str] | None = None) -> int:
         "logposterior": float(logposterior),
         "n_data": int(problem.data.size),
     }
-    with open(output_dir / f"{prefix}_optimization_summary.json", "w", encoding="utf-8") as handle:
+    summary_path = output_dir / f"{prefix}_optimization_summary.json"
+    with open(summary_path, "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
+
+    from abacustabulation.derived import write_optimization_derived
+
+    try:
+        derived = write_optimization_derived(problem, best, output_dir, prefix)
+    except Exception as exc:
+        if _postprocess_fail_on_error(problem):
+            raise
+        summary["postprocess_error"] = {"type": type(exc).__name__, "message": str(exc)}
+        error_path = output_dir / f"{prefix}_postprocess_error.txt"
+        with open(error_path, "w", encoding="utf-8") as handle:
+            handle.write(f"{type(exc).__name__}: {exc}\n")
+        print(f"postprocess failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+    else:
+        if derived:
+            summary["derived"] = derived
+    with open(summary_path, "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
     print(json.dumps(summary, indent=2), flush=True)
     return 0

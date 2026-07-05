@@ -441,67 +441,6 @@ def smu_multipoles(
     return out
 
 
-def _z_directory(z_mock: float) -> str:
-    return f"z{float(z_mock):.3f}"
-
-
-def _has_sim_format_fields(value: str) -> bool:
-    return any(field in value for field in ("{sim_name", "{z", "{z_mock"))
-
-
-def _format_config_path(value: str | Path, *, sim_name: str, z_mock: float) -> Path:
-    template = str(value)
-    z_dir = _z_directory(z_mock)
-    has_fields = _has_sim_format_fields(template)
-    path = Path(
-        template.format(
-            sim_name=sim_name,
-            z=z_dir,
-            z_mock=float(z_mock),
-        )
-    )
-    if has_fields or tuple(path.parts[-2:]) == (sim_name, z_dir):
-        return path
-    return path / sim_name / z_dir
-
-
-def _sanitize_filename_piece(value: object) -> str:
-    clean = []
-    for char in str(value):
-        if char.isalnum():
-            clean.append(char)
-        else:
-            clean.append("-")
-    return "".join(clean).strip("-") or "none"
-
-
-def _find_paircount_file(
-    output_dir: Path,
-    *,
-    clustering: str,
-    position_dataset: str,
-    file_tag: str | None,
-    nmass_bins: int,
-) -> Path:
-    pos = _sanitize_filename_piece(position_dataset)
-    if file_tag is not None:
-        tag = _sanitize_filename_piece(file_tag)
-        path = output_dir / f"paircounts_{clustering}_{pos}_{tag}_m{nmass_bins}.h5"
-        if not path.exists():
-            raise FileNotFoundError(path)
-        return path
-    matches = sorted(output_dir.glob(f"paircounts_{clustering}_{pos}_*_m{nmass_bins}.h5"))
-    if len(matches) == 1:
-        return matches[0]
-    if not matches:
-        raise FileNotFoundError(
-            f"No paircount file matching paircounts_{clustering}_{pos}_*_m{nmass_bins}.h5 in {output_dir}."
-        )
-    raise ValueError(
-        f"Found multiple matching paircount files in {output_dir}; set paircounts.file_tag."
-    )
-
-
 def galaxy_correlation_from_config(
     path2config: str | Path,
     *,
@@ -516,16 +455,14 @@ def galaxy_correlation_from_config(
     config = load_config(path2config)
 
     sim_params = config.get("sim_params", {})
-    paths_params = config.get("paths", {})
     pair_params = config.get("paircounts", {})
-    mass_params = pair_params.get("mass", {})
     hod_params = config.get("hod", {})
     if "params" not in hod_params:
         raise KeyError("Set hod.params in the config, or call galaxy_correlation_from_paircounts directly.")
 
-    sim_name = str(sim_params.get("sim_name", ""))
-    z_mock = float(sim_params.get("z_mock", 0.0))
-    configured_modes = pair_params.get("clustering", ["rppi"])
+    jobs = pair_params.get("jobs") or {}
+    job_params = dict(jobs.get("clustering", {})) if jobs else {}
+    configured_modes = job_params.get("clustering", pair_params.get("clustering", ["rppi"]))
     if clustering is not None:
         mode = str(clustering)
     elif isinstance(configured_modes, list):
@@ -534,20 +471,20 @@ def galaxy_correlation_from_config(
         mode = str(configured_modes)
     if "," in mode:
         mode = mode.split(",", 1)[0].strip()
-    pos_dataset = str(position_dataset or pair_params.get("position_dataset", "pos"))
-    nmass_bins = int(mass_params.get("nmass_bins", pair_params.get("nmass_bins", 20)))
 
     if paircount_path is None:
-        output_value = pair_params.get("output_dir", paths_params.get("paircounts_dir"))
-        if output_value is None:
-            raise KeyError("Set paircounts.output_dir or paths.paircounts_dir.")
-        output_dir = _format_config_path(output_value, sim_name=sim_name, z_mock=z_mock)
-        paircount_path = _find_paircount_file(
-            output_dir,
+        from .paircounts import resolve_paircount_path_from_config
+
+        path_config: dict[str, Any] = {}
+        if jobs:
+            path_config["job"] = "clustering"
+        if position_dataset is not None:
+            path_config["position_dataset"] = position_dataset
+        paircount_path = resolve_paircount_path_from_config(
+            config,
             clustering=mode,
-            position_dataset=pos_dataset,
-            file_tag=pair_params.get("file_tag"),
-            nmass_bins=nmass_bins,
+            path_config=path_config,
+            job_name="clustering" if jobs else None,
         )
 
     return galaxy_correlation_from_paircounts(

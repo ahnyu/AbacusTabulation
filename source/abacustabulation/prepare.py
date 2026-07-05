@@ -238,6 +238,10 @@ def _validate_position_space(position_space: str) -> str:
     return position_space
 
 
+def _writes_rsd(position_space: str) -> bool:
+    return position_space in {"rsd", "both"}
+
+
 def _dataset_kwargs(compression: str | None) -> dict[str, Any]:
     if compression is None:
         return {}
@@ -290,7 +294,7 @@ def _write_particle_file_streaming(
             "pos", shape=(n_particles, 3), dtype=position_dtype, **kwargs
         )
         pos_rsd_ds = None
-        if position_space == "both":
+        if _writes_rsd(position_space):
             pos_rsd_ds = group.create_dataset(
                 "pos_rsd", shape=(n_particles, 3), dtype=position_dtype, **kwargs
             )
@@ -307,7 +311,7 @@ def _write_particle_file_streaming(
         chunk_limit = max(1, int(particle_chunk_size))
         h0 = 0
         p0 = 0
-        needs_rsd = position_space in {"rsd", "both"}
+        needs_rsd = _writes_rsd(position_space)
 
         while h0 < n_halos:
             while h0 < n_halos and halo_counts[h0] <= 0:
@@ -366,12 +370,9 @@ def _write_particle_file_streaming(
                     los_axis=los_axis,
                     box_origin=box_origin,
                 )
-                if position_space == "rsd":
-                    pos_ds[p0 : p0 + size] = rsd_pos.astype(position_dtype, copy=False)
-                else:
-                    pos_ds[p0 : p0 + size] = real_pos.astype(position_dtype, copy=False)
-                    assert pos_rsd_ds is not None
-                    pos_rsd_ds[p0 : p0 + size] = rsd_pos.astype(position_dtype, copy=False)
+                pos_ds[p0 : p0 + size] = real_pos.astype(position_dtype, copy=False)
+                assert pos_rsd_ds is not None
+                pos_rsd_ds[p0 : p0 + size] = rsd_pos.astype(position_dtype, copy=False)
             else:
                 pos_ds[p0 : p0 + size] = real_pos.astype(position_dtype, copy=False)
 
@@ -409,8 +410,8 @@ def prepare_slab(
     """Prepare one halo slab and sampled NFW particle positions.
 
     Compact output schema:
-    halos: id, N, pos, npstart, npout, and pos_rsd only for position_space='both'.
-    particles: halo_index, pos, optional pos_rsd, and optional radius.
+    halos: id, N, real-space pos, npstart, npout, and optional pos_rsd.
+    particles: halo_index, real-space pos, optional pos_rsd, and optional radius.
     """
 
     if satellite_velocity_model not in {"gaussian", "halo"}:
@@ -421,7 +422,7 @@ def prepare_slab(
     position_space = _validate_position_space(position_space)
     position_dtype = _normalize_dtype(position_dtype)
     index_dtype = _normalize_dtype(index_dtype)
-    needs_rsd = position_space in {"rsd", "both"}
+    needs_rsd = _writes_rsd(position_space)
 
     extra_fields = [concentration_numerator_key, concentration_denominator_key]
     if needs_rsd:
@@ -479,20 +480,14 @@ def prepare_slab(
     else:
         halo_pos_rsd = None
 
-    if position_space == "rsd":
-        assert halo_pos_rsd is not None
-        halo_output_pos = halo_pos_rsd
-    else:
-        halo_output_pos = halo_pos
-
     halo_arrays: dict[str, np.ndarray] = {
         "id": halo_id,
         "N": halo_n,
-        "pos": halo_output_pos.astype(position_dtype, copy=False),
+        "pos": halo_pos.astype(position_dtype, copy=False),
         "npstart": halo_starts,
         "npout": halo_counts,
     }
-    if position_space == "both":
+    if needs_rsd:
         assert halo_pos_rsd is not None
         halo_arrays["pos_rsd"] = halo_pos_rsd.astype(position_dtype, copy=False)
 
@@ -506,6 +501,7 @@ def prepare_slab(
         "Lbox": lbox,
         "Mpart": mpart,
         "position_space": position_space,
+        "pos_dataset_space": "real",
         "rsd_los_axis": axis,
         "box_origin": box_origin,
         "satellite_velocity_model": satellite_velocity_model,
@@ -522,8 +518,10 @@ def prepare_slab(
         ),
         "min_particles_per_halo": int(min_particles_per_halo),
         "nfw_tolerance": float(nfw_tolerance),
-        "schema_version": "compact_v1",
+        "schema_version": "compact_v2",
     }
+    if needs_rsd:
+        attrs["pos_rsd_dataset_space"] = "rsd"
     if velz2kms is not None:
         attrs["velz2kms"] = velz2kms
     if max_particles_per_halo is not None:

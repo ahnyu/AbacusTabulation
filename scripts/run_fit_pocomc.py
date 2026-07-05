@@ -54,6 +54,11 @@ def _run_sampler(problem, pc, *, output_dir: Path, prefix: str, pool, resume_sta
     return sampler
 
 
+def _postprocess_fail_on_error(problem) -> bool:
+    post = problem.fit_config.get("postprocess", {})
+    return bool(post.get("fail_on_error", post.get("fail_on_postprocess_error", False)))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -101,7 +106,21 @@ def main(argv: list[str] | None = None) -> int:
         evidence = np.array([], dtype=np.float64)
     if evidence.size:
         np.savetxt(output_dir / f"{prefix}_evidence.txt", evidence.reshape(1, -1))
+    from abacustabulation.derived import write_mcmc_derived
+
+    derived_summary = {}
+    try:
+        derived_summary = write_mcmc_derived(problem, samples, weights, logl, logp, output_dir, prefix)
+    except Exception as exc:
+        if _postprocess_fail_on_error(problem):
+            raise
+        error_path = output_dir / f"{prefix}_postprocess_error.txt"
+        with open(error_path, "w", encoding="utf-8") as handle:
+            handle.write(f"{type(exc).__name__}: {exc}\n")
+        print(f"postprocess failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
     print(f"wrote {output_dir / (prefix + '_chains.txt')}", flush=True)
+    if derived_summary:
+        print(f"wrote {output_dir / (prefix + '_chains_derived.txt')}", flush=True)
     return 0
 
 

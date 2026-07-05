@@ -9,6 +9,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from .clustering import HODClusteringTabulator, projected_wp, smu_multipoles
+from .hmf import HaloMassFunction, find_hmf_file, hod_number_density, read_hmf
 
 
 ArrayLike = np.ndarray | Sequence[float]
@@ -78,6 +79,7 @@ class NumberDensityConstraint:
     value: float
     mode: str = "minimum"
     error: float | None = None
+    source: str = "paircounts"
 
     def loglike(self, theory_density: float) -> float:
         mode = self.mode.lower()
@@ -179,6 +181,7 @@ class HODFittingProblem:
         observables: Sequence[ObservableSpec],
         tabulators: Mapping[Any, HODClusteringTabulator],
         density_constraints: Sequence[NumberDensityConstraint] = (),
+        hmfs: Mapping[str, HaloMassFunction] | None = None,
         config: Mapping[str, Any] | None = None,
         fit_config: Mapping[str, Any] | None = None,
         tracers: Sequence[str] = (),
@@ -188,6 +191,7 @@ class HODFittingProblem:
         self.observables = tuple(observables)
         self.tabulators = dict(tabulators)
         self.density_constraints = tuple(density_constraints)
+        self.hmfs = dict(hmfs or {})
         self.config = dict(config or {})
         self.fit_config = dict(fit_config or {})
         self.tracers = tuple(str(item) for item in (tracers or _infer_tracers(self.observables)))
@@ -234,13 +238,15 @@ class HODFittingProblem:
                     n_subbins=spec.n_subbins,
                 )
 
+        density_constraints = _parse_density_constraints(fit_config, tracers)
         problem = cls(
             data=data,
             parameters=parameters,
             fixed_params=_parse_fixed_params(config, fit_config, tracers),
             observables=observables,
             tabulators=tabulators,
-            density_constraints=_parse_density_constraints(fit_config, tracers),
+            density_constraints=density_constraints,
+            hmfs=_load_fit_hmfs(config, fit_config, density_constraints),
             config=config,
             fit_config=fit_config,
             tracers=tracers,
@@ -356,6 +362,15 @@ class HODFittingProblem:
             result = result_cache[cache_key]
             densities.setdefault(spec.tracer, float(result.number_density))
             segments.append(_extract_observable(result, spec))
+        for constraint in self.density_constraints:
+            if constraint.source == "hmf":
+                if constraint.tracer not in self.hmfs:
+                    raise KeyError(f"No HMF loaded for tracer {constraint.tracer!r}.")
+                densities[constraint.tracer] = hod_number_density(
+                    self.hmfs[constraint.tracer],
+                    self.params_for_tracer(theta, constraint.tracer),
+                    hod_model=self._hod_model_for_tracer(constraint.tracer),
+                )
         theory = np.concatenate(segments) if segments else np.array([], dtype=np.float64)
         return _TheoryEvaluation(theory_vector=theory, number_densities=densities)
 
@@ -372,6 +387,12 @@ class HODFittingProblem:
                 return -np.inf
             total += term
         return float(total)
+
+    def _hod_model_for_tracer(self, tracer: str) -> str:
+        for spec in self.observables:
+            if spec.tracer == tracer:
+                return spec.hod_model
+        raise KeyError(f"No observable is configured for tracer {tracer!r}; cannot infer HOD model.")
 
     def _theta(self, theta: ArrayLike) -> np.ndarray:
         theta = np.asarray(theta, dtype=np.float64).reshape(-1)
@@ -565,10 +586,18 @@ def _validate_selection(
 
 def _configured_bin_count(config: Mapping[str, Any], spec: ObservableSpec) -> int | None:
     pair_params = config.get("paircounts", {})
+    job_params = {}
+    jobs = pair_params.get("jobs") or {}
+    if jobs:
+        job_params = dict(jobs.get("clustering", {}))
     if spec.statistic == "wp":
-        value = pair_params.get("rppi", {}).get("nrp_bins")
+        params = dict(pair_params.get("rppi", {}))
+        params.update(dict(job_params.get("rppi", {})))
+        value = params.get("nrp_bins")
     else:
-        value = pair_params.get("smu", {}).get("ns_bins")
+        params = dict(pair_params.get("smu", {}))
+        params.update(dict(job_params.get("smu", {})))
+        value = params.get("ns_bins")
     return None if value is None else int(value)
 
 
@@ -662,6 +691,9 @@ def _parse_density_constraints(
         mode = str(config.get("mode", "minimum")).lower()
         if mode == "none":
             continue
+        source = str(config.get("source", "paircounts")).lower()
+        if source not in {"paircounts", "hmf"}:
+            raise ValueError(f"number_density.source must be 'paircounts' or 'hmf' for tracer {tracer!r}.")
         value = float(_required(config, "value"))
         error = config.get("error")
         constraints.append(
@@ -670,9 +702,43 @@ def _parse_density_constraints(
                 value=value,
                 mode=mode,
                 error=None if error is None else float(error),
+                source=source,
             )
         )
     return tuple(constraints)
+
+
+def _load_fit_hmfs(
+    config: Mapping[str, Any],
+    fit_config: Mapping[str, Any],
+    density_constraints: Sequence[NumberDensityConstraint],
+) -> dict[str, HaloMassFunction]:
+    hmfs: dict[str, HaloMassFunction] = {}
+    for tracer in sorted({item.tracer for item in density_constraints if item.source == "hmf"}):
+        hmfs[tracer] = read_hmf(_resolve_hmf_path(config, fit_config, tracer))
+    return hmfs
+
+
+def _resolve_hmf_path(config: Mapping[str, Any], fit_config: Mapping[str, Any], tracer: str) -> Path:
+    hmf_config = dict(config.get("hmf", {}))
+    tracer_hmf = _tracer_theory_config(fit_config, tracer).get("hmf", {})
+    hmf_config.update(tracer_hmf)
+    if hmf_config.get("path") is not None:
+        return _format_config_path(hmf_config["path"], config)
+    pair_params = config.get("paircounts", {})
+    prepare_params = config.get("prepare_profiles", {})
+    output_value = hmf_config.get("output_dir", hmf_config.get("out_dir"))
+    if output_value is None:
+        raise KeyError(
+            f"Set hmf.output_dir, hmf.path, or fit.theory.tracers.{tracer}.hmf.path for HMF density constraints."
+        )
+    output_dir = _format_sim_output_dir(output_value, config)
+    return find_hmf_file(
+        output_dir,
+        file_tag=_first_not_none(hmf_config.get("file_tag"), pair_params.get("file_tag")),
+        seed=_first_not_none(hmf_config.get("seed"), pair_params.get("seed"), prepare_params.get("seed")),
+        n_bins=int(hmf_config.get("n_bins", 512)),
+    )
 
 
 def _parse_fixed_params(
@@ -735,22 +801,16 @@ def _validate_parameter_ownership(parameters: Sequence[FitParameter], tracers: S
 
 
 def _resolve_paircount_path(config: Mapping[str, Any], path_config: Mapping[str, Any], *, clustering: str) -> Path:
-    paths_params = config.get("paths", {})
-    pair_params = config.get("paircounts", {})
-    mass_params = pair_params.get("mass", {})
-    output_value = path_config.get("dir", path_config.get("paircounts_dir", pair_params.get("output_dir", paths_params.get("paircounts_dir"))))
-    if output_value is None:
-        raise KeyError("Set paircounts.output_dir, paths.paircounts_dir, or theory.tracers.<tracer>.paircounts.<mode>.dir.")
-    output_dir = _format_sim_output_dir(output_value, config)
-    position_dataset = str(path_config.get("position_dataset", pair_params.get("position_dataset", "pos")))
-    file_tag = path_config.get("file_tag", pair_params.get("file_tag"))
-    nmass_bins = int(path_config.get("nmass_bins", mass_params.get("nmass_bins", pair_params.get("nmass_bins", 20))))
-    return _find_paircount_file(
-        output_dir,
+    from .paircounts import resolve_paircount_path_from_config
+
+    job_name = path_config.get("job")
+    if job_name is None and config.get("paircounts", {}).get("jobs"):
+        job_name = "clustering"
+    return resolve_paircount_path_from_config(
+        config,
         clustering=clustering,
-        position_dataset=position_dataset,
-        file_tag=file_tag,
-        nmass_bins=nmass_bins,
+        path_config=path_config,
+        job_name=job_name,
     )
 
 
@@ -913,35 +973,3 @@ def _format_sim_output_dir(value: str | Path, config: Mapping[str, Any]) -> Path
     if has_fields or tuple(path.parts[-2:]) == (sim_name, z_dir):
         return path
     return path / sim_name / z_dir
-
-
-def _sanitize_filename_piece(value: object) -> str:
-    clean = []
-    for char in str(value):
-        clean.append(char if char.isalnum() else "-")
-    return "".join(clean).strip("-") or "none"
-
-
-def _find_paircount_file(
-    output_dir: Path,
-    *,
-    clustering: str,
-    position_dataset: str,
-    file_tag: str | None,
-    nmass_bins: int,
-) -> Path:
-    pos = _sanitize_filename_piece(position_dataset)
-    if file_tag is not None:
-        tag = _sanitize_filename_piece(file_tag)
-        path = output_dir / f"paircounts_{clustering}_{pos}_{tag}_m{nmass_bins}.h5"
-        if not path.exists():
-            raise FileNotFoundError(path)
-        return path
-    matches = sorted(output_dir.glob(f"paircounts_{clustering}_{pos}_*_m{nmass_bins}.h5"))
-    if len(matches) == 1:
-        return matches[0]
-    if not matches:
-        raise FileNotFoundError(
-            f"No paircount file matching paircounts_{clustering}_{pos}_*_m{nmass_bins}.h5 in {output_dir}."
-        )
-    raise ValueError(f"Found multiple matching paircount files in {output_dir}; set paircounts.file_tag.")
