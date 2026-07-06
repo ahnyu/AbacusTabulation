@@ -106,7 +106,23 @@ If enabled, optimization writes `*_optimum_derived.json`; MCMC writes `*_chains_
 
 Linear bias requires the `linear_bias` paircount job and `cosmoprimo` in the runtime environment.
 
-## 7. Data and Covariance Notes
+## 7. Plot Fit Outputs
+
+```python
+from abacustabulation import load_fit_plot_data
+
+fit = load_fit_plot_data("configs/my_run.yaml", label="LRG")
+
+fit.plot_triangle(params=["logMcut", "sigma", "logM1", "alpha", "LRG.number_density"])
+fit.plot_fit(max_samples=1000)
+fit.plot_hod(max_samples=1000)
+
+print(fit.parameter_stats["LRG.number_density"].mean)
+```
+
+`load_fit_plot_data` prefers `*_chains_derived.txt` when present. It keeps the original chain in `fit.chain`, all sampled plus derived columns in `fit.samples`, the GetDist object in `fit.getdist_sample`, data points in `fit.data_points`, and GetDist-style summaries in `fit.parameter_stats`. Pass `prefer_derived=False` to read the raw `*_chains.txt` file.
+
+## 8. Data and Covariance Notes
 
 - `fit.observables` order defines the theory/data vector order.
 - Supported statistics are `wp`, `xi0`, and `xi2`.
@@ -115,7 +131,7 @@ Linear bias requires the `linear_bias` paircount job and `cosmoprimo` in the run
 - `covariance.mode: block` accepts either sliced block covariances or full pre-slice block covariances.
 - `covariance.precision_scale` multiplies the inverse covariance; pass a Hartlap factor there, or set `covariance_n_mocks` to let the code compute it.
 
-## 8. Quick Checks
+## 9. Quick Checks
 
 ```bash
 python3 -m compileall source/abacustabulation scripts
