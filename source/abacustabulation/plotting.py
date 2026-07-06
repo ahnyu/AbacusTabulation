@@ -725,6 +725,7 @@ def plot_fit_bands(
     show_data: bool = True,
     xscale: str = "log",
     plot_rp_wp: bool = True,
+    titles: Sequence[str] | bool | None = None,
     max_samples: int | None = None,
     random_state: int | np.random.Generator | None = None,
     quantiles: tuple[float, float] = DEFAULT_BAND_QUANTILES,
@@ -754,6 +755,7 @@ def plot_fit_bands(
     upper_axes = axes[0]
     residual_axes = axes[1]
     fit_labels = _plot_labels(labels, len(band_sets))
+    panel_titles = _panel_titles(titles, n_panels, band_sets[0])
     for i, (ax, rax) in enumerate(zip(upper_axes, residual_axes, strict=True)):
         reference = band_sets[0][i]
         rax.axhspan(-1.0, 1.0, color="lightgray", alpha=0.6, linewidth=0, zorder=0)
@@ -791,6 +793,8 @@ def plot_fit_bands(
             rax.set_xscale(xscale)
         ax.tick_params(axis="x", labelbottom=False)
         ax.set_ylabel(_observable_y_label(reference.statistic, plot_rp_wp=plot_rp_wp), fontsize=labelsize)
+        if panel_titles[i] is not None:
+            ax.set_title(panel_titles[i], fontsize=labelsize)
         rax.set_xlabel(_observable_x_label(reference.statistic), fontsize=labelsize)
         rax.set_ylabel(_residual_y_label(reference.statistic), fontsize=labelsize)
         _style_axis(ax, ticksize=ticksize, legendsize=legendsize)
@@ -902,7 +906,9 @@ def plot_hod_bands(
     legendsize: int = DEFAULT_LEGENDSIZE,
     ticksize: int = DEFAULT_TICKSIZE,
     alpha: float = 0.25,
+    show_band: Sequence[bool] | bool | None = None,
     yscale: str | None = "log",
+    ylim: tuple[float, float] | None = (1.0e-3, 10.0**1.5),
     tracer: str | None = None,
     logm: np.ndarray | None = None,
     hod_model: str | None = None,
@@ -913,8 +919,9 @@ def plot_hod_bands(
     """Plot HOD occupation bands for one or several loaded fits."""
 
     plt = _matplotlib_pyplot()
+    fit_list = _fit_plot_data_list(fits)
     band_list = hod_bands_from_fits(
-        _fit_plot_data_list(fits),
+        fit_list,
         tracer=tracer,
         logm=logm,
         hod_model=hod_model,
@@ -924,10 +931,11 @@ def plot_hod_bands(
     )
     if not band_list:
         raise ValueError("No HOD bands were provided.")
-    labels = labels or [None] * len(band_list)
+    fit_labels = _plot_labels(labels, len(band_list))
+    show_bands = _show_band_flags(show_band, len(band_list))
     fig, ax = plt.subplots(figsize=figsize)
     linestyles = {"central": "-", "satellite": "--", "total": ":"}
-    for band, chain_label in zip(band_list, labels, strict=True):
+    for band, chain_label, draw_band in zip(band_list, fit_labels, show_bands, strict=True):
         base_label = chain_label or band.label or band.tracer
         for component in components:
             mean, lower, upper = _hod_component_arrays(band, component)
@@ -938,9 +946,12 @@ def plot_hod_bands(
                 linestyle=linestyles.get(component, "-"),
                 label=f"{base_label} {component}",
             )[0]
-            ax.fill_between(band.logm, lower, upper, color=line.get_color(), alpha=alpha, linewidth=0)
+            if draw_band:
+                ax.fill_between(band.logm, lower, upper, color=line.get_color(), alpha=alpha, linewidth=0)
     if yscale is not None:
         ax.set_yscale(yscale)
+    if ylim is not None:
+        ax.set_ylim(*ylim)
     ax.set_xlabel(r"$\log_{10}(M_h/[M_\odot/h])$", fontsize=labelsize)
     ax.set_ylabel(r"$\langle N \rangle$", fontsize=labelsize)
     _style_axis(ax, ticksize=ticksize, legendsize=legendsize)
@@ -997,6 +1008,34 @@ def _plot_labels(labels: Sequence[str] | None, size: int) -> list[str | None]:
     out = [None if label is None else str(label) for label in labels]
     if len(out) != int(size):
         raise ValueError(f"labels has length {len(out)}; expected {int(size)} to match the number of fits.")
+    return out
+
+
+def _panel_titles(
+    titles: Sequence[str] | bool | None,
+    size: int,
+    reference_bands: Sequence[ObservableFitBand],
+) -> list[str | None]:
+    if titles is None or titles is False:
+        return [None] * int(size)
+    if titles is True:
+        return [str(band.name) for band in reference_bands]
+    if isinstance(titles, str):
+        return [titles] * int(size)
+    out = [None if title is None else str(title) for title in titles]
+    if len(out) != int(size):
+        raise ValueError(f"titles has length {len(out)}; expected {int(size)} to match the number of panels.")
+    return out
+
+
+def _show_band_flags(show_band: Sequence[bool] | bool | None, size: int) -> list[bool]:
+    if show_band is None:
+        return [True] * int(size)
+    if isinstance(show_band, bool):
+        return [bool(show_band)] * int(size)
+    out = [bool(item) for item in show_band]
+    if len(out) != int(size):
+        raise ValueError(f"show_band has length {len(out)}; expected {int(size)} to match the number of fits.")
     return out
 
 
