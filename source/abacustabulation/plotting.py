@@ -24,6 +24,12 @@ DEFAULT_LABELSIZE = 20
 DEFAULT_LEGENDSIZE = 20
 DEFAULT_TICKSIZE = 18
 DEFAULT_BAND_QUANTILES = (16.0, 84.0)
+DEFAULT_DERIVED_PARAMETERS = (
+    "linear_bias",
+    "satellite_fraction",
+    "log10_mh_cen_med",
+    "log10_mh_sat_med",
+)
 DEFAULT_PARAMETER_LABELS = {
     "logMcut": r"\log M_{\rm cut}",
     "logM1": r"\log M_1",
@@ -39,10 +45,10 @@ DEFAULT_PARAMETER_LABELS = {
     "n_sat": r"n_{\rm sat}",
     "number_density": r"n_{\rm g}",
     "satellite_fraction": r"f_{\rm sat}",
-    "log10_mh_cen_med": r"\log M_{\rm h,cen}^{\rm med}",
-    "log10_mh_sat_med": r"\log M_{\rm h,sat}^{\rm med}",
-    "mh_cen_med": r"M_{\rm h,cen}^{\rm med}",
-    "mh_sat_med": r"M_{\rm h,sat}^{\rm med}",
+    "log10_mh_cen_med": r"\log_{10} \widetilde{M}_{\rm h,cen}",
+    "log10_mh_sat_med": r"\log_{10} \widetilde{M}_{\rm h,sat}",
+    "mh_cen_med": r"\widetilde{M}_{\rm h,cen}",
+    "mh_sat_med": r"\widetilde{M}_{\rm h,sat}",
     "linear_bias": r"b_{\rm lin}",
 }
 
@@ -971,6 +977,131 @@ def plot_hods(fits: Sequence[FitPlotData], **kwargs: Any):
     return plot_hod_bands(fits, **kwargs)
 
 
+def plot_derived_parameters(
+    fits: FitPlotData | Sequence[FitPlotData],
+    x_values: Sequence[float],
+    x_label: str,
+    *,
+    derived_params: Sequence[str] = DEFAULT_DERIVED_PARAMETERS,
+    derived_labels: Mapping[str, str] | Sequence[str] | None = None,
+    figsize_per_panel: tuple[float, float] = DEFAULT_FIGSIZE_PER_PANEL,
+    labelsize: int = DEFAULT_LABELSIZE,
+    legendsize: int = DEFAULT_LEGENDSIZE,
+    ticksize: int = DEFAULT_TICKSIZE,
+    markersize: float = 4.0,
+    capsize: float = 3.0,
+    color: str | None = None,
+    xscale: str | None = None,
+):
+    """Plot derived parameters with errors against an external x-property."""
+
+    plt = _matplotlib_pyplot()
+    fit_list = _fit_plot_data_list(fits)
+    x = np.asarray(x_values, dtype=np.float64).reshape(-1)
+    if x.size != len(fit_list):
+        raise ValueError(f"x_values has length {x.size}; expected {len(fit_list)} to match the number of fits.")
+    params = tuple(str(item) for item in derived_params)
+    if not params:
+        raise ValueError("derived_params must contain at least one parameter name.")
+    ylabels = _derived_parameter_labels(params, derived_labels)
+    fig, axes = plt.subplots(
+        len(params),
+        1,
+        figsize=(figsize_per_panel[0], figsize_per_panel[1] * len(params)),
+        sharex=True,
+        squeeze=False,
+    )
+    axes = axes[:, 0]
+    for ax, param, ylabel in zip(axes, params, ylabels, strict=True):
+        stats = [_resolve_parameter_stat(fit, param) for fit in fit_list]
+        mean = np.asarray([stat.mean for stat in stats], dtype=np.float64)
+        err_minus = np.asarray([stat.err_minus for stat in stats], dtype=np.float64)
+        err_plus = np.asarray([stat.err_plus for stat in stats], dtype=np.float64)
+        ax.errorbar(
+            x,
+            mean,
+            yerr=np.vstack([err_minus, err_plus]),
+            fmt="o-",
+            color=color,
+            markersize=markersize,
+            capsize=capsize,
+        )
+        ax.set_ylabel(ylabel, fontsize=labelsize)
+        if xscale is not None:
+            ax.set_xscale(xscale)
+        _style_axis(ax, ticksize=ticksize, legendsize=legendsize)
+    axes[-1].set_xlabel(str(x_label), fontsize=labelsize)
+    fig.tight_layout()
+    return fig, axes
+
+
+def plot_joint_grid(
+    plot_function: Any,
+    input_sets: Sequence[Any],
+    *,
+    nrows: int,
+    ncols: int,
+    args: Sequence[Any] = (),
+    kwargs: Mapping[str, Any] | None = None,
+    per_set_args: Sequence[Sequence[Any]] | None = None,
+    per_set_kwargs: Sequence[Mapping[str, Any]] | None = None,
+    figsize_per_panel: tuple[float, float] = DEFAULT_FIGSIZE_PER_PANEL,
+    titles: Sequence[str] | None = None,
+    close: bool = True,
+    interpolation: str = "nearest",
+):
+    """Compose several plots from one plotting function into a grid figure.
+
+    ``plot_function`` is called once per item in ``input_sets``. Each item is
+    passed as the first positional argument, followed by shared ``args`` and any
+    matching ``per_set_args`` entry. Shared ``kwargs`` are merged with matching
+    ``per_set_kwargs`` entries. The number of input sets must equal
+    ``nrows * ncols``.
+    """
+
+    plt = _matplotlib_pyplot()
+    input_sets = list(input_sets)
+    nrows = int(nrows)
+    ncols = int(ncols)
+    if nrows <= 0 or ncols <= 0:
+        raise ValueError("nrows and ncols must be positive integers.")
+    if len(input_sets) != nrows * ncols:
+        raise ValueError(
+            f"Got {len(input_sets)} input sets, but nrows*ncols is {nrows * ncols} "
+            f"({nrows}*{ncols})."
+        )
+    shared_args = tuple(args or ())
+    shared_kwargs = dict(kwargs or {})
+    per_set_args = _optional_sequence(per_set_args, len(input_sets), name="per_set_args")
+    per_set_kwargs = _optional_sequence(per_set_kwargs, len(input_sets), name="per_set_kwargs")
+    panel_titles = _grid_titles(titles, len(input_sets))
+
+    images = []
+    for i, input_set in enumerate(input_sets):
+        call_args = (input_set, *shared_args, *tuple(per_set_args[i] or ()))
+        call_kwargs = dict(shared_kwargs)
+        call_kwargs.update(dict(per_set_kwargs[i] or {}))
+        result = plot_function(*call_args, **call_kwargs)
+        panel_fig = _figure_from_plot_result(result)
+        images.append(_figure_to_rgb_array(panel_fig))
+        if close:
+            plt.close(panel_fig)
+
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(figsize_per_panel[0] * ncols, figsize_per_panel[1] * nrows),
+        squeeze=False,
+    )
+    for ax, image, title in zip(axes.ravel(), images, panel_titles, strict=True):
+        ax.imshow(image, interpolation=interpolation)
+        ax.set_axis_off()
+        if title is not None:
+            ax.set_title(title, fontsize=DEFAULT_LABELSIZE)
+    fig.tight_layout()
+    return fig, axes
+
+
 # -----------------------------------------------------------------------------
 # Internal helpers
 
@@ -1000,6 +1131,44 @@ def _fit_plot_data_list(value: FitPlotData | Sequence[FitPlotData]) -> list[FitP
     if not out or not all(isinstance(item, FitPlotData) for item in out):
         raise TypeError("Expected FitPlotData or a sequence of FitPlotData.")
     return out
+
+
+def _optional_sequence(value: Sequence[Any] | None, size: int, *, name: str) -> list[Any | None]:
+    if value is None:
+        return [None] * int(size)
+    out = list(value)
+    if len(out) != int(size):
+        raise ValueError(f"{name} has length {len(out)}; expected {int(size)} to match input_sets.")
+    return out
+
+
+def _grid_titles(titles: Sequence[str] | None, size: int) -> list[str | None]:
+    if titles is None:
+        return [None] * int(size)
+    out = [None if title is None else str(title) for title in titles]
+    if len(out) != int(size):
+        raise ValueError(f"titles has length {len(out)}; expected {int(size)} to match input_sets.")
+    return out
+
+
+def _figure_from_plot_result(result: Any):
+    if isinstance(result, tuple) and result:
+        candidate = result[0]
+    else:
+        candidate = result
+    if hasattr(candidate, "canvas"):
+        return candidate
+    if hasattr(candidate, "fig") and hasattr(candidate.fig, "canvas"):
+        return candidate.fig
+    if hasattr(candidate, "figure") and hasattr(candidate.figure, "canvas"):
+        return candidate.figure
+    raise TypeError("plot_function must return a Matplotlib Figure, (Figure, axes), or object with a .fig Figure.")
+
+
+def _figure_to_rgb_array(fig: Any) -> np.ndarray:
+    fig.canvas.draw()
+    rgba = np.asarray(fig.canvas.buffer_rgba())
+    return np.array(rgba[..., :3], copy=True)
 
 
 def _plot_labels(labels: Sequence[str] | None, size: int) -> list[str | None]:
@@ -1037,6 +1206,29 @@ def _show_band_flags(show_band: Sequence[bool] | bool | None, size: int) -> list
     if len(out) != int(size):
         raise ValueError(f"show_band has length {len(out)}; expected {int(size)} to match the number of fits.")
     return out
+
+
+def _resolve_parameter_stat(fit: FitPlotData, name: str) -> ParameterStats:
+    name = str(name)
+    if name not in fit.parameter_stats:
+        raise KeyError(f"Derived parameter {name!r} not found. Available parameters: {tuple(fit.parameter_stats)}.")
+    return fit.parameter_stats[name]
+
+
+def _derived_parameter_labels(
+    params: Sequence[str],
+    labels: Mapping[str, str] | Sequence[str] | None,
+) -> list[str]:
+    if labels is None:
+        return [_default_parameter_label(param) for param in params]
+    if isinstance(labels, Mapping):
+        return [
+            str(labels.get(param, labels.get(_parameter_label_key(param), _default_parameter_label(param))))
+            for param in params
+        ]
+    if len(labels) != len(params):
+        raise ValueError(f"derived_labels has length {len(labels)}; expected {len(params)}.")
+    return [str(label) for label in labels]
 
 
 def _chain_parameter_values(chain: ChainSamples, name: str) -> np.ndarray:

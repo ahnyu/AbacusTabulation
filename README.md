@@ -109,18 +109,20 @@ Linear bias requires the `linear_bias` paircount job and `cosmoprimo` in the run
 ## 7. Plot Fit Outputs
 
 ```python
-from abacustabulation import load_fit_plot_data, plot_fit_bands, plot_hod_bands, plot_triangle
+from abacustabulation import load_fit_plot_data, plot_derived_parameters, plot_fit_bands, plot_hod_bands, plot_joint_grid, plot_triangle
 
 fit = load_fit_plot_data("configs/my_run.yaml", label="LRG")
 
 plot_triangle(fit, params=["logMcut", "sigma", "logM1", "alpha", "LRG.number_density"])
 plot_fit_bands(fit, max_samples=1000)  # pass labels=[...] for overlaid runs
 plot_hod_bands(fit, max_samples=1000)
+plot_derived_parameters([fit], x_values=[0.8], x_label="redshift", derived_params=["LRG.linear_bias", "LRG.satellite_fraction", "LRG.log10_mh_cen_med", "LRG.log10_mh_sat_med"])
+# plot_joint_grid(plot_fit_bands, [[fit_a, fit_b], [fit_c, fit_d]], nrows=1, ncols=2)
 
 print(fit.parameter_stats["LRG.number_density"].mean)
 ```
 
-`load_fit_plot_data` prefers `*_chains_derived.txt` when present. It keeps the original chain in `fit.chain`, all sampled plus derived columns in `fit.samples`, the GetDist object in `fit.getdist_sample`, data points in `fit.data_points`, and GetDist-style summaries in `fit.parameter_stats`. Fitting plots show `r_p w_p` by default for `wp` and include a lower `(model-data)/sigma` residual panel; pass `plot_rp_wp=False` to show raw `w_p` and `titles=True` to show panel titles. For HOD overlays, pass `show_band=[True, False, ...]` to control which fits draw bands. Pass `prefer_derived=False` to read the raw `*_chains.txt` file.
+`load_fit_plot_data` prefers `*_chains_derived.txt` when present. It keeps the original chain in `fit.chain`, all sampled plus derived columns in `fit.samples`, the GetDist object in `fit.getdist_sample`, data points in `fit.data_points`, and GetDist-style summaries in `fit.parameter_stats`. Fitting plots show `r_p w_p` by default for `wp` and include a lower `(model-data)/sigma` residual panel; pass `plot_rp_wp=False` to show raw `w_p` and `titles=True` to show panel titles. For HOD overlays, pass `show_band=[True, False, ...]` to control which fits draw bands. Derived plot parameter names must exist exactly in every fit. Pass `prefer_derived=False` to read the raw `*_chains.txt` file.
 
 ## 8. Data and Covariance Notes
 

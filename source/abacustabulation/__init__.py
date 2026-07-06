@@ -56,6 +56,8 @@ _EXPORTS = {
     "plot_hod_bands": (".plotting", "plot_hod_bands"),
     "plot_hod": (".plotting", "plot_hod"),
     "plot_hods": (".plotting", "plot_hods"),
+    "plot_derived_parameters": (".plotting", "plot_derived_parameters"),
+    "plot_joint_grid": (".plotting", "plot_joint_grid"),
     "load_config": (".config", "load_config"),
     "merge_configs": (".config", "merge_configs"),
     "HODClusteringTabulator": (".clustering", "HODClusteringTabulator"),
