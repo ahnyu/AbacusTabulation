@@ -25,31 +25,31 @@ DEFAULT_LEGENDSIZE = 20
 DEFAULT_TICKSIZE = 18
 DEFAULT_BAND_QUANTILES = (16.0, 84.0)
 DEFAULT_DERIVED_PARAMETERS = (
-    "linear_bias",
-    "satellite_fraction",
-    "log10_mh_cen_med",
-    "log10_mh_sat_med",
+    "LRG.linear_bias",
+    "LRG.satellite_fraction",
+    "LRG.log10_mh_cen_med",
+    "LRG.log10_mh_sat_med",
 )
 DEFAULT_PARAMETER_LABELS = {
-    "logMcut": r"\log M_{\rm cut}",
-    "logM1": r"\log M_1",
-    "sigma": r"\sigma",
-    "alpha": r"\alpha",
-    "kappa": r"\kappa",
-    "a_c": r"a_{\rm c}",
-    "a_s": r"a_{\rm s}",
-    "Q": r"Q",
-    "gamma": r"\gamma",
-    "maxpdf": r"p_{\rm max}",
-    "n_cen": r"n_{\rm cen}",
-    "n_sat": r"n_{\rm sat}",
-    "number_density": r"n_{\rm g}",
-    "satellite_fraction": r"f_{\rm sat}",
-    "log10_mh_cen_med": r"\log_{10} \widetilde{M}_{\rm h,cen}",
-    "log10_mh_sat_med": r"\log_{10} \widetilde{M}_{\rm h,sat}",
-    "mh_cen_med": r"\widetilde{M}_{\rm h,cen}",
-    "mh_sat_med": r"\widetilde{M}_{\rm h,sat}",
-    "linear_bias": r"b_{\rm lin}",
+    "logMcut": r"$\log M_{\rm cut}$",
+    "logM1": r"$\log M_1$",
+    "sigma": r"$\sigma$",
+    "alpha": r"$\alpha$",
+    "kappa": r"$\kappa$",
+    "a_c": r"$a_{\rm c}$",
+    "a_s": r"$a_{\rm s}$",
+    "Q": r"$Q$",
+    "gamma": r"$\gamma$",
+    "maxpdf": r"$p_{\rm max}$",
+    "n_cen": r"$n_{\rm cen}$",
+    "n_sat": r"$n_{\rm sat}$",
+    "number_density": r"$n_{\rm g}$",
+    "satellite_fraction": r"$f_{\rm sat}$",
+    "log10_mh_cen_med": r"$\log_{10} \widetilde{M}_{\rm h,cen}$",
+    "log10_mh_sat_med": r"$\log_{10} \widetilde{M}_{\rm h,sat}$",
+    "mh_cen_med": r"$\widetilde{M}_{\rm h,cen}$",
+    "mh_sat_med": r"$\widetilde{M}_{\rm h,sat}$",
+    "linear_bias": r"$b_{\rm lin}$",
 }
 
 
@@ -941,19 +941,24 @@ def plot_hod_bands(
     show_bands = _show_band_flags(show_band, len(band_list))
     fig, ax = plt.subplots(figsize=figsize)
     linestyles = {"central": "-", "satellite": "--", "total": ":"}
+    legend_handles = []
+    legend_labels = []
     for band, chain_label, draw_band in zip(band_list, fit_labels, show_bands, strict=True):
         base_label = chain_label or band.label or band.tracer
+        color = _next_axis_color(ax)
+        legend_handles.append(_color_block_handle(color))
+        legend_labels.append(base_label)
         for component in components:
             mean, lower, upper = _hod_component_arrays(band, component)
             mean, lower, upper = _hod_plot_values(mean, lower, upper, yscale=yscale)
-            line = ax.plot(
+            ax.plot(
                 band.logm,
                 mean,
+                color=color,
                 linestyle=linestyles.get(component, "-"),
-                label=f"{base_label} {component}",
-            )[0]
+            )
             if draw_band:
-                ax.fill_between(band.logm, lower, upper, color=line.get_color(), alpha=alpha, linewidth=0)
+                ax.fill_between(band.logm, lower, upper, color=color, alpha=alpha, linewidth=0)
     if yscale is not None:
         ax.set_yscale(yscale)
     if ylim is not None:
@@ -961,6 +966,8 @@ def plot_hod_bands(
     ax.set_xlabel(r"$\log_{10}(M_h/[M_\odot/h])$", fontsize=labelsize)
     ax.set_ylabel(r"$\langle N \rangle$", fontsize=labelsize)
     _style_axis(ax, ticksize=ticksize, legendsize=legendsize)
+    if legend_handles:
+        ax.legend(legend_handles, legend_labels, fontsize=legendsize)
     fig.tight_layout()
     return fig, ax
 
@@ -990,6 +997,7 @@ def plot_derived_parameters(
     ticksize: int = DEFAULT_TICKSIZE,
     markersize: float = 4.0,
     capsize: float = 3.0,
+    lw: float = 2.0,
     color: str | None = None,
     xscale: str | None = None,
 ):
@@ -1025,6 +1033,9 @@ def plot_derived_parameters(
             color=color,
             markersize=markersize,
             capsize=capsize,
+            linewidth=lw,
+            elinewidth=lw,
+            capthick=lw,
         )
         ax.set_ylabel(ylabel, fontsize=labelsize)
         if xscale is not None:
@@ -1049,6 +1060,7 @@ def plot_joint_grid(
     titles: Sequence[str] | None = None,
     close: bool = True,
     interpolation: str = "nearest",
+    sharey: bool = True,
 ):
     """Compose several plots from one plotting function into a grid figure.
 
@@ -1056,7 +1068,8 @@ def plot_joint_grid(
     passed as the first positional argument, followed by shared ``args`` and any
     matching ``per_set_args`` entry. Shared ``kwargs`` are merged with matching
     ``per_set_kwargs`` entries. The number of input sets must equal
-    ``nrows * ncols``.
+    ``nrows * ncols``. If ``sharey`` is true, y-limits are synchronized
+    across corresponding axes before each panel figure is rasterized.
     """
 
     plt = _matplotlib_pyplot()
@@ -1076,13 +1089,19 @@ def plot_joint_grid(
     per_set_kwargs = _optional_sequence(per_set_kwargs, len(input_sets), name="per_set_kwargs")
     panel_titles = _grid_titles(titles, len(input_sets))
 
-    images = []
+    panel_figs = []
     for i, input_set in enumerate(input_sets):
         call_args = (input_set, *shared_args, *tuple(per_set_args[i] or ()))
         call_kwargs = dict(shared_kwargs)
         call_kwargs.update(dict(per_set_kwargs[i] or {}))
         result = plot_function(*call_args, **call_kwargs)
-        panel_fig = _figure_from_plot_result(result)
+        panel_figs.append(_figure_from_plot_result(result))
+
+    if sharey:
+        _share_panel_y_limits(panel_figs)
+
+    images = []
+    for panel_fig in panel_figs:
         images.append(_figure_to_rgb_array(panel_fig))
         if close:
             plt.close(panel_fig)
@@ -1092,6 +1111,7 @@ def plot_joint_grid(
         ncols,
         figsize=(figsize_per_panel[0] * ncols, figsize_per_panel[1] * nrows),
         squeeze=False,
+        sharey=sharey,
     )
     for ax, image, title in zip(axes.ravel(), images, panel_titles, strict=True):
         ax.imshow(image, interpolation=interpolation)
@@ -1169,6 +1189,30 @@ def _figure_to_rgb_array(fig: Any) -> np.ndarray:
     fig.canvas.draw()
     rgba = np.asarray(fig.canvas.buffer_rgba())
     return np.array(rgba[..., :3], copy=True)
+
+
+def _share_panel_y_limits(figs: Sequence[Any]) -> None:
+    axes_by_fig = [[ax for ax in fig.axes if ax.get_visible()] for fig in figs]
+    if not axes_by_fig or any(not axes for axes in axes_by_fig):
+        return
+    n_axes = min(len(axes) for axes in axes_by_fig)
+    for index in range(n_axes):
+        limits = []
+        for axes in axes_by_fig:
+            y0, y1 = axes[index].get_ylim()
+            if np.isfinite(y0) and np.isfinite(y1) and y0 != y1:
+                limits.extend((y0, y1))
+        if not limits:
+            continue
+        low = float(np.min(limits))
+        high = float(np.max(limits))
+        if low == high:
+            continue
+        for axes in axes_by_fig:
+            y0, y1 = axes[index].get_ylim()
+            axes[index].set_ylim(low, high) if y1 >= y0 else axes[index].set_ylim(high, low)
+    for fig in figs:
+        fig.canvas.draw_idle()
 
 
 def _plot_labels(labels: Sequence[str] | None, size: int) -> list[str | None]:
@@ -1603,6 +1647,21 @@ def _hod_plot_values(
         return mean, lower, upper
     floor = 1.0e-8
     return np.clip(mean, floor, None), np.clip(lower, floor, None), np.clip(upper, floor, None)
+
+
+def _next_axis_color(ax: Any) -> Any:
+    (line,) = ax.plot([], [])
+    color = line.get_color()
+    line.remove()
+    return color
+
+
+def _color_block_handle(color: Any) -> Any:
+    try:
+        from matplotlib.patches import Patch
+    except ImportError as exc:  # pragma: no cover - optional plotting dependency.
+        raise ImportError("matplotlib is required for plotting helpers.") from exc
+    return Patch(facecolor=color, edgecolor=color)
 
 
 def _hod_component_arrays(band: HODBand, component: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
