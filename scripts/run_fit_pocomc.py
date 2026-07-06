@@ -4,16 +4,30 @@
 from __future__ import annotations
 
 import argparse
+from multiprocessing import get_context
 import sys
 from pathlib import Path
 
-import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_DIR = REPO_ROOT / "source"
 if str(SOURCE_DIR) not in sys.path:
     sys.path.insert(0, str(SOURCE_DIR))
+
+
+_MULTIPROCESSING_PROBLEM = None
+
+
+def _set_multiprocessing_problem(problem) -> None:
+    global _MULTIPROCESSING_PROBLEM
+    _MULTIPROCESSING_PROBLEM = problem
+
+
+def _multiprocessing_loglike(theta) -> float:
+    if _MULTIPROCESSING_PROBLEM is None:
+        raise RuntimeError("Multiprocessing worker was not initialized with a fitting problem.")
+    return _MULTIPROCESSING_PROBLEM.loglike(theta)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -23,6 +37,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-prefix", help="Override fit.output.prefix.")
     parser.add_argument("--resume-state-path", help="Override fit.mcmc.pocomc.resume_state_path.")
     parser.add_argument("--no-mpi", action="store_true", help="Disable fit.mcmc.pocomc.use_mpi.")
+    parser.add_argument(
+        "--n-processes",
+        type=int,
+        help="Use a local multiprocessing pool with N processes; overrides fit.mcmc.pocomc.n_processes.",
+    )
+    parser.add_argument(
+        "--mp-start-method",
+        help="multiprocessing start method; overrides fit.mcmc.pocomc.multiprocessing_start_method.",
+    )
     parser.add_argument("--no-validate", action="store_true", help="Skip initial theory/data length validation.")
     return parser
 
@@ -36,7 +59,16 @@ def _output_settings(problem, args) -> tuple[Path, str]:
     return output_dir, prefix
 
 
-def _run_sampler(problem, pc, *, output_dir: Path, prefix: str, pool, resume_state_path: str | None) -> object:
+def _run_sampler(
+    problem,
+    pc,
+    *,
+    output_dir: Path,
+    prefix: str,
+    pool,
+    loglike,
+    resume_state_path: str | None,
+) -> object:
     mcmc_config = problem.fit_config.get("mcmc", {}).get("pocomc", {})
     sampler_kwargs = dict(mcmc_config.get("sampler", {}))
     run_kwargs = dict(mcmc_config.get("run", {"n_total": 4096, "save_every": 5}))
@@ -44,7 +76,7 @@ def _run_sampler(problem, pc, *, output_dir: Path, prefix: str, pool, resume_sta
         run_kwargs["resume_state_path"] = resume_state_path
     sampler = pc.Sampler(
         problem.pocomc_prior(),
-        problem.loglike,
+        loglike,
         pool=pool,
         output_dir=str(output_dir),
         output_label=prefix,
@@ -59,9 +91,28 @@ def _postprocess_fail_on_error(problem) -> bool:
     return bool(post.get("fail_on_error", post.get("fail_on_postprocess_error", False)))
 
 
+def _configured_n_processes(args, pocomc_config) -> int:
+    value = args.n_processes if args.n_processes is not None else pocomc_config.get("n_processes", 1)
+    n_processes = int(value)
+    if n_processes < 1:
+        raise ValueError("fit.mcmc.pocomc.n_processes must be at least 1.")
+    return n_processes
+
+
+def _multiprocessing_context(start_method: str | None):
+    if start_method is None:
+        start_method = "fork"
+    try:
+        return get_context(str(start_method))
+    except ValueError as exc:
+        raise ValueError(f"Unsupported multiprocessing start method {start_method!r}.") from exc
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    import numpy as np
 
     try:
         import pocomc as pc
@@ -75,6 +126,10 @@ def main(argv: list[str] | None = None) -> int:
     pocomc_config = problem.fit_config.get("mcmc", {}).get("pocomc", {})
     resume_state_path = args.resume_state_path or pocomc_config.get("resume_state_path")
     use_mpi = bool(pocomc_config.get("use_mpi", False)) and not args.no_mpi
+    n_processes = _configured_n_processes(args, pocomc_config)
+
+    if use_mpi and n_processes > 1:
+        raise ValueError("Use either MPI or local multiprocessing, not both; pass --no-mpi to use --n-processes.")
 
     if use_mpi:
         with pc.parallel.MPIPool() as pool:
@@ -84,6 +139,26 @@ def main(argv: list[str] | None = None) -> int:
                 output_dir=output_dir,
                 prefix=prefix,
                 pool=pool,
+                loglike=problem.loglike,
+                resume_state_path=resume_state_path,
+            )
+    elif n_processes > 1:
+        start_method = args.mp_start_method or pocomc_config.get("multiprocessing_start_method", "fork")
+        context = _multiprocessing_context(start_method)
+        _set_multiprocessing_problem(problem)
+        print(f"using local multiprocessing pool with {n_processes} processes", flush=True)
+        with context.Pool(
+            n_processes,
+            initializer=_set_multiprocessing_problem,
+            initargs=(problem,),
+        ) as pool:
+            sampler = _run_sampler(
+                problem,
+                pc,
+                output_dir=output_dir,
+                prefix=prefix,
+                pool=pool,
+                loglike=_multiprocessing_loglike,
                 resume_state_path=resume_state_path,
             )
     else:
@@ -93,6 +168,7 @@ def main(argv: list[str] | None = None) -> int:
             output_dir=output_dir,
             prefix=prefix,
             pool=None,
+            loglike=problem.loglike,
             resume_state_path=resume_state_path,
         )
 

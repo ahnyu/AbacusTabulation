@@ -73,7 +73,10 @@ pocoMC:
 
 ```bash
 python3 scripts/run_fit_pocomc.py --path2config configs/my_run.yaml
+python3 scripts/run_fit_pocomc.py --path2config configs/my_run.yaml --n-processes 8
 ```
+
+Use `fit.mcmc.pocomc.use_mpi: true` for MPI runs, or `fit.mcmc.pocomc.n_processes > 1` for local multiprocessing on one node.
 
 For a fixed HOD parameter, remove it from `fit.parameters` and put it under `fit.theory.tracers.<TRACER>.fixed_params`, for example:
 
