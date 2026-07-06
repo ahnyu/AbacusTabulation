@@ -962,6 +962,13 @@ def _as_string_list(value: Any) -> list[str]:
     return [str(item) for item in value]
 
 
+def _first_not_none(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
 def _z_directory(z_mock: float) -> str:
     return f"z{float(z_mock):.3f}"
 
