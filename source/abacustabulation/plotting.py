@@ -728,11 +728,12 @@ def plot_fit_bands(
     random_state: int | np.random.Generator | None = None,
     quantiles: tuple[float, float] = DEFAULT_BAND_QUANTILES,
 ):
-    """Plot one or more loaded fits against the measured data vector."""
+    """Plot loaded fits and normalized residuals against the measured data."""
 
     plt = _matplotlib_pyplot()
+    fit_list = _fit_plot_data_list(fits)
     band_sets = fit_bands_from_fits(
-        _fit_plot_data_list(fits),
+        fit_list,
         max_samples=max_samples,
         random_state=random_state,
         quantiles=quantiles,
@@ -740,45 +741,60 @@ def plot_fit_bands(
     if not band_sets:
         raise ValueError("No fit bands were provided.")
     n_panels = len(band_sets[0])
+    upper_height = float(figsize_per_panel[1])
     fig, axes = plt.subplots(
-        1,
+        2,
         n_panels,
-        figsize=(figsize_per_panel[0] * n_panels, figsize_per_panel[1]),
+        figsize=(figsize_per_panel[0] * n_panels, upper_height * 4.0 / 3.0),
+        gridspec_kw={"height_ratios": (3, 1)},
+        sharex="col",
         squeeze=False,
     )
-    axes = axes[0]
+    upper_axes = axes[0]
+    residual_axes = axes[1]
     labels = labels or [None] * len(band_sets)
-    for i, ax in enumerate(axes):
+    for i, (ax, rax) in enumerate(zip(upper_axes, residual_axes, strict=True)):
         reference = band_sets[0][i]
-        ref_scale = _observable_plot_scale(reference, plot_rp_wp=plot_rp_wp)
-        if show_data:
-            ax.errorbar(
-                reference.x,
-                reference.data * ref_scale,
-                yerr=reference.error * np.abs(ref_scale),
-                fmt="o",
-                color="k",
-                label="data",
-            )
+        rax.axhspan(-1.0, 1.0, color="lightgray", alpha=0.6, linewidth=0, zorder=0)
+        rax.axhline(0.0, color="0.4", linewidth=1.0, zorder=1)
         for band_set, chain_label in zip(band_sets, labels, strict=True):
             band = band_set[i]
             scale = _observable_plot_scale(band, plot_rp_wp=plot_rp_wp)
             line_label = chain_label or band.label
             line = ax.plot(band.x, band.mean * scale, label=line_label)[0]
+            color = line.get_color()
             ax.fill_between(
                 band.x,
                 band.lower * scale,
                 band.upper * scale,
-                color=line.get_color(),
+                color=color,
                 alpha=alpha,
                 linewidth=0,
             )
+            if show_data:
+                ax.errorbar(
+                    band.x,
+                    band.data * scale,
+                    yerr=band.error * np.abs(scale),
+                    fmt="o",
+                    color=color,
+                    ecolor=color,
+                    markersize=4,
+                    linestyle="none",
+                    label=None if line_label is None else f"{line_label} data",
+                )
+            residual = _normalized_fit_residual(band)
+            rax.plot(band.x, residual, color=color, marker="o", markersize=3, linewidth=1.0)
         if xscale and np.all(reference.x > 0.0):
             ax.set_xscale(xscale)
-        ax.set_xlabel(_observable_x_label(reference.statistic), fontsize=labelsize)
+            rax.set_xscale(xscale)
+        ax.tick_params(axis="x", labelbottom=False)
         ax.set_ylabel(_observable_y_label(reference.statistic, plot_rp_wp=plot_rp_wp), fontsize=labelsize)
         ax.set_title(reference.name, fontsize=labelsize)
+        rax.set_xlabel(_observable_x_label(reference.statistic), fontsize=labelsize)
+        rax.set_ylabel(_residual_y_label(reference.statistic), fontsize=labelsize)
         _style_axis(ax, ticksize=ticksize, legendsize=legendsize)
+        _style_axis(rax, ticksize=ticksize, legendsize=legendsize)
     fig.tight_layout()
     return fig, axes
 
@@ -1308,6 +1324,23 @@ def _observable_plot_scale(band: ObservableFitBand, *, plot_rp_wp: bool) -> np.n
     if band.statistic == "wp" and plot_rp_wp:
         return band.x
     return 1.0
+
+
+def _normalized_fit_residual(band: ObservableFitBand) -> np.ndarray:
+    error = np.asarray(band.error, dtype=np.float64)
+    residual = np.full_like(error, np.nan, dtype=np.float64)
+    good = np.isfinite(error) & (error > 0.0)
+    residual[good] = (np.asarray(band.mean, dtype=np.float64)[good] - np.asarray(band.data, dtype=np.float64)[good]) / error[good]
+    return residual
+
+
+def _residual_y_label(statistic: str) -> str:
+    labels = {
+        "wp": r"$\Delta w_p/\sigma_{w_p}$",
+        "xi0": r"$\Delta \xi_0/\sigma_{\xi_0}$",
+        "xi2": r"$\Delta \xi_2/\sigma_{\xi_2}$",
+    }
+    return labels.get(statistic, r"$\Delta/\sigma$")
 
 
 def _parameter_label_key(name: str) -> str:
