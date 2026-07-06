@@ -8,6 +8,7 @@ plots; plotting functions operate on already-loaded chains, bands, or HOD curves
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
 from pathlib import Path
 import re
 from typing import Any, Mapping, Sequence
@@ -723,9 +724,10 @@ def plot_fit_bands(
     *,
     labels: Sequence[str] | None = None,
     figsize_per_panel: tuple[float, float] = DEFAULT_FIGSIZE_PER_PANEL,
-    labelsize: int = DEFAULT_LABELSIZE,
-    legendsize: int = DEFAULT_LEGENDSIZE,
-    ticksize: int = DEFAULT_TICKSIZE,
+    labelsize: float | None = None,
+    legendsize: float | None = None,
+    ticksize: float | None = None,
+    font_scale: float | None = None,
     alpha: float = 0.25,
     markersize: float = 4.0,
     show_data: bool = True,
@@ -739,6 +741,13 @@ def plot_fit_bands(
     """Plot loaded fits and normalized residuals against the measured data."""
 
     plt = _matplotlib_pyplot()
+    labelsize, legendsize, ticksize = _resolved_plot_style_sizes(
+        figsize_per_panel,
+        labelsize=labelsize,
+        legendsize=legendsize,
+        ticksize=ticksize,
+        font_scale=font_scale,
+    )
     fit_list = _fit_plot_data_list(fits)
     band_sets = fit_bands_from_fits(
         fit_list,
@@ -908,9 +917,10 @@ def plot_hod_bands(
     components: Sequence[str] = ("central", "satellite"),
     labels: Sequence[str] | None = None,
     figsize: tuple[float, float] = DEFAULT_FIGSIZE_PER_PANEL,
-    labelsize: int = DEFAULT_LABELSIZE,
-    legendsize: int = DEFAULT_LEGENDSIZE,
-    ticksize: int = DEFAULT_TICKSIZE,
+    labelsize: float | None = None,
+    legendsize: float | None = None,
+    ticksize: float | None = None,
+    font_scale: float | None = None,
     alpha: float = 0.25,
     show_band: Sequence[bool] | bool | None = None,
     yscale: str | None = "log",
@@ -925,6 +935,13 @@ def plot_hod_bands(
     """Plot HOD occupation bands for one or several loaded fits."""
 
     plt = _matplotlib_pyplot()
+    labelsize, legendsize, ticksize = _resolved_plot_style_sizes(
+        figsize,
+        labelsize=labelsize,
+        legendsize=legendsize,
+        ticksize=ticksize,
+        font_scale=font_scale,
+    )
     fit_list = _fit_plot_data_list(fits)
     band_list = hod_bands_from_fits(
         fit_list,
@@ -992,9 +1009,10 @@ def plot_derived_parameters(
     derived_params: Sequence[str] = DEFAULT_DERIVED_PARAMETERS,
     derived_labels: Mapping[str, str] | Sequence[str] | None = None,
     figsize_per_panel: tuple[float, float] = DEFAULT_FIGSIZE_PER_PANEL,
-    labelsize: int = DEFAULT_LABELSIZE,
-    legendsize: int = DEFAULT_LEGENDSIZE,
-    ticksize: int = DEFAULT_TICKSIZE,
+    labelsize: float | None = None,
+    legendsize: float | None = None,
+    ticksize: float | None = None,
+    font_scale: float | None = None,
     markersize: float = 4.0,
     capsize: float = 3.0,
     lw: float = 2.0,
@@ -1008,6 +1026,13 @@ def plot_derived_parameters(
     x = np.asarray(x_values, dtype=np.float64).reshape(-1)
     if x.size != len(fit_list):
         raise ValueError(f"x_values has length {x.size}; expected {len(fit_list)} to match the number of fits.")
+    labelsize, legendsize, ticksize = _resolved_plot_style_sizes(
+        figsize_per_panel,
+        labelsize=labelsize,
+        legendsize=legendsize,
+        ticksize=ticksize,
+        font_scale=font_scale,
+    )
     params = tuple(str(item) for item in derived_params)
     if not params:
         raise ValueError("derived_params must contain at least one parameter name.")
@@ -1061,6 +1086,8 @@ def plot_joint_grid(
     close: bool = True,
     interpolation: str = "nearest",
     sharey: bool = True,
+    scale_style: bool = True,
+    font_scale: float | None = None,
 ):
     """Compose several plots from one plotting function into a grid figure.
 
@@ -1068,8 +1095,12 @@ def plot_joint_grid(
     passed as the first positional argument, followed by shared ``args`` and any
     matching ``per_set_args`` entry. Shared ``kwargs`` are merged with matching
     ``per_set_kwargs`` entries. The number of input sets must equal
-    ``nrows * ncols``. If ``sharey`` is true, y-limits are synchronized
-    across corresponding axes before each panel figure is rasterized.
+    ``nrows * ncols``. Child figures are sized to ``figsize_per_panel``
+    when the child plotting function supports ``figsize`` or
+    ``figsize_per_panel``. If ``sharey`` is true, y-limits are synchronized
+    across corresponding axes before each panel figure is rasterized. If
+    ``scale_style`` is true, child label, legend, and tick font sizes are
+    scaled with ``figsize_per_panel`` unless explicitly supplied.
     """
 
     plt = _matplotlib_pyplot()
@@ -1094,6 +1125,13 @@ def plot_joint_grid(
         call_args = (input_set, *shared_args, *tuple(per_set_args[i] or ()))
         call_kwargs = dict(shared_kwargs)
         call_kwargs.update(dict(per_set_kwargs[i] or {}))
+        _apply_joint_grid_child_defaults(
+            plot_function,
+            call_kwargs,
+            figsize_per_panel=figsize_per_panel,
+            scale_style=scale_style,
+            font_scale=font_scale,
+        )
         result = plot_function(*call_args, **call_kwargs)
         panel_figs.append(_figure_from_plot_result(result))
 
@@ -1106,10 +1144,11 @@ def plot_joint_grid(
         if close:
             plt.close(panel_fig)
 
+    panel_width, panel_height = _grid_panel_figsize(panel_figs, fallback=figsize_per_panel)
     fig, axes = plt.subplots(
         nrows,
         ncols,
-        figsize=(figsize_per_panel[0] * ncols, figsize_per_panel[1] * nrows),
+        figsize=(panel_width * ncols, panel_height * nrows),
         squeeze=False,
         sharey=sharey,
     )
@@ -1189,6 +1228,100 @@ def _figure_to_rgb_array(fig: Any) -> np.ndarray:
     fig.canvas.draw()
     rgba = np.asarray(fig.canvas.buffer_rgba())
     return np.array(rgba[..., :3], copy=True)
+
+
+def _grid_panel_figsize(figs: Sequence[Any], *, fallback: tuple[float, float]) -> tuple[float, float]:
+    sizes = []
+    for fig in figs:
+        try:
+            width, height = fig.get_size_inches()
+        except Exception:
+            continue
+        if np.isfinite(width) and np.isfinite(height) and width > 0.0 and height > 0.0:
+            sizes.append((float(width), float(height)))
+    if not sizes:
+        return _figsize_tuple(fallback)
+    return max(width for width, _ in sizes), max(height for _, height in sizes)
+
+
+def _apply_joint_grid_child_defaults(
+    plot_function: Any,
+    call_kwargs: dict[str, Any],
+    *,
+    figsize_per_panel: tuple[float, float],
+    scale_style: bool,
+    font_scale: float | None,
+) -> None:
+    if _accepts_keyword(plot_function, "figsize_per_panel") and "figsize_per_panel" not in call_kwargs:
+        call_kwargs["figsize_per_panel"] = figsize_per_panel
+    if _accepts_keyword(plot_function, "figsize") and "figsize" not in call_kwargs:
+        call_kwargs["figsize"] = figsize_per_panel
+    if not scale_style:
+        return
+    if _accepts_keyword(plot_function, "font_scale") and "font_scale" not in call_kwargs:
+        call_kwargs["font_scale"] = _plot_style_scale(figsize_per_panel, font_scale=font_scale)
+    labelsize, legendsize, ticksize = _resolved_plot_style_sizes(
+        figsize_per_panel,
+        labelsize=None,
+        legendsize=None,
+        ticksize=None,
+        font_scale=font_scale,
+    )
+    defaults = {"labelsize": labelsize, "legendsize": legendsize, "ticksize": ticksize}
+    for key, value in defaults.items():
+        if key not in call_kwargs and _accepts_keyword(plot_function, key):
+            call_kwargs[key] = value
+
+
+def _accepts_keyword(function: Any, name: str) -> bool:
+    try:
+        signature = inspect.signature(function)
+    except (TypeError, ValueError):
+        return False
+    for parameter in signature.parameters.values():
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+    return name in signature.parameters
+
+
+def _resolved_plot_style_sizes(
+    figsize_per_panel: tuple[float, float],
+    *,
+    labelsize: float | None,
+    legendsize: float | None,
+    ticksize: float | None,
+    font_scale: float | None,
+) -> tuple[float, float, float]:
+    scale = _plot_style_scale(figsize_per_panel, font_scale=font_scale)
+    return (
+        _resolved_scaled_size(labelsize, DEFAULT_LABELSIZE, scale),
+        _resolved_scaled_size(legendsize, DEFAULT_LEGENDSIZE, scale),
+        _resolved_scaled_size(ticksize, DEFAULT_TICKSIZE, scale),
+    )
+
+
+def _resolved_scaled_size(value: float | None, default: float, scale: float) -> float:
+    if value is not None:
+        return float(value)
+    return max(1.0, float(default) * scale)
+
+
+def _plot_style_scale(figsize_per_panel: tuple[float, float], *, font_scale: float | None) -> float:
+    if font_scale is not None:
+        scale = float(font_scale)
+        if scale <= 0.0 or not np.isfinite(scale):
+            raise ValueError("font_scale must be a positive finite value.")
+        return scale
+    width, height = _figsize_tuple(figsize_per_panel)
+    base_width, base_height = DEFAULT_FIGSIZE_PER_PANEL
+    return max(min(width / base_width, height / base_height), 1.0e-6)
+
+
+def _figsize_tuple(figsize: tuple[float, float]) -> tuple[float, float]:
+    width, height = float(figsize[0]), float(figsize[1])
+    if width <= 0.0 or height <= 0.0 or not (np.isfinite(width) and np.isfinite(height)):
+        raise ValueError("figsize_per_panel must contain positive finite values.")
+    return width, height
 
 
 def _share_panel_y_limits(figs: Sequence[Any]) -> None:
