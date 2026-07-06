@@ -114,7 +114,7 @@ from abacustabulation import load_fit_plot_data, plot_fit_bands, plot_hod_bands,
 fit = load_fit_plot_data("configs/my_run.yaml", label="LRG")
 
 plot_triangle(fit, params=["logMcut", "sigma", "logM1", "alpha", "LRG.number_density"])
-plot_fit_bands(fit, max_samples=1000)
+plot_fit_bands(fit, max_samples=1000)  # pass labels=[...] for overlaid runs
 plot_hod_bands(fit, max_samples=1000)
 
 print(fit.parameter_stats["LRG.number_density"].mean)

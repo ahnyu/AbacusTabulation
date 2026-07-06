@@ -721,6 +721,7 @@ def plot_fit_bands(
     legendsize: int = DEFAULT_LEGENDSIZE,
     ticksize: int = DEFAULT_TICKSIZE,
     alpha: float = 0.25,
+    markersize: float = 4.0,
     show_data: bool = True,
     xscale: str = "log",
     plot_rp_wp: bool = True,
@@ -752,12 +753,12 @@ def plot_fit_bands(
     )
     upper_axes = axes[0]
     residual_axes = axes[1]
-    labels = labels or [None] * len(band_sets)
+    fit_labels = _plot_labels(labels, len(band_sets))
     for i, (ax, rax) in enumerate(zip(upper_axes, residual_axes, strict=True)):
         reference = band_sets[0][i]
         rax.axhspan(-1.0, 1.0, color="lightgray", alpha=0.6, linewidth=0, zorder=0)
         rax.axhline(0.0, color="0.4", linewidth=1.0, zorder=1)
-        for band_set, chain_label in zip(band_sets, labels, strict=True):
+        for band_set, chain_label in zip(band_sets, fit_labels, strict=True):
             band = band_set[i]
             scale = _observable_plot_scale(band, plot_rp_wp=plot_rp_wp)
             line_label = chain_label or band.label
@@ -779,18 +780,17 @@ def plot_fit_bands(
                     fmt="o",
                     color=color,
                     ecolor=color,
-                    markersize=4,
+                    markersize=markersize,
                     linestyle="none",
-                    label=None if line_label is None else f"{line_label} data",
+                    label=None,
                 )
             residual = _normalized_fit_residual(band)
-            rax.plot(band.x, residual, color=color, marker="o", markersize=3, linewidth=1.0)
+            rax.plot(band.x, residual, color=color, marker="o", markersize=markersize, linewidth=1.0)
         if xscale and np.all(reference.x > 0.0):
             ax.set_xscale(xscale)
             rax.set_xscale(xscale)
         ax.tick_params(axis="x", labelbottom=False)
         ax.set_ylabel(_observable_y_label(reference.statistic, plot_rp_wp=plot_rp_wp), fontsize=labelsize)
-        ax.set_title(reference.name, fontsize=labelsize)
         rax.set_xlabel(_observable_x_label(reference.statistic), fontsize=labelsize)
         rax.set_ylabel(_residual_y_label(reference.statistic), fontsize=labelsize)
         _style_axis(ax, ticksize=ticksize, legendsize=legendsize)
@@ -988,6 +988,15 @@ def _fit_plot_data_list(value: FitPlotData | Sequence[FitPlotData]) -> list[FitP
     out = list(value)
     if not out or not all(isinstance(item, FitPlotData) for item in out):
         raise TypeError("Expected FitPlotData or a sequence of FitPlotData.")
+    return out
+
+
+def _plot_labels(labels: Sequence[str] | None, size: int) -> list[str | None]:
+    if labels is None:
+        return [None] * int(size)
+    out = [None if label is None else str(label) for label in labels]
+    if len(out) != int(size):
+        raise ValueError(f"labels has length {len(out)}; expected {int(size)} to match the number of fits.")
     return out
 
 
