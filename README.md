@@ -109,18 +109,18 @@ Linear bias requires the `linear_bias` paircount job and `cosmoprimo` in the run
 ## 7. Plot Fit Outputs
 
 ```python
-from abacustabulation import load_fit_plot_data
+from abacustabulation import load_fit_plot_data, plot_fit_bands, plot_hod_bands, plot_triangle
 
 fit = load_fit_plot_data("configs/my_run.yaml", label="LRG")
 
-fit.plot_triangle(params=["logMcut", "sigma", "logM1", "alpha", "LRG.number_density"])
-fit.plot_fit(max_samples=1000)
-fit.plot_hod(max_samples=1000)
+plot_triangle(fit, params=["logMcut", "sigma", "logM1", "alpha", "LRG.number_density"])
+plot_fit_bands(fit, max_samples=1000)
+plot_hod_bands(fit, max_samples=1000)
 
 print(fit.parameter_stats["LRG.number_density"].mean)
 ```
 
-`load_fit_plot_data` prefers `*_chains_derived.txt` when present. It keeps the original chain in `fit.chain`, all sampled plus derived columns in `fit.samples`, the GetDist object in `fit.getdist_sample`, data points in `fit.data_points`, and GetDist-style summaries in `fit.parameter_stats`. Pass `prefer_derived=False` to read the raw `*_chains.txt` file.
+`load_fit_plot_data` prefers `*_chains_derived.txt` when present. It keeps the original chain in `fit.chain`, all sampled plus derived columns in `fit.samples`, the GetDist object in `fit.getdist_sample`, data points in `fit.data_points`, and GetDist-style summaries in `fit.parameter_stats`. Fitting plots show `r_p w_p` by default for `wp`; pass `plot_rp_wp=False` to show raw `w_p`. Pass `prefer_derived=False` to read the raw `*_chains.txt` file.
 
 ## 8. Data and Covariance Notes
 

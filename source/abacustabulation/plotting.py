@@ -24,6 +24,27 @@ DEFAULT_LABELSIZE = 20
 DEFAULT_LEGENDSIZE = 20
 DEFAULT_TICKSIZE = 18
 DEFAULT_BAND_QUANTILES = (16.0, 84.0)
+DEFAULT_PARAMETER_LABELS = {
+    "logMcut": r"\log M_{\rm cut}",
+    "logM1": r"\log M_1",
+    "sigma": r"\sigma",
+    "alpha": r"\alpha",
+    "kappa": r"\kappa",
+    "a_c": r"a_{\rm c}",
+    "a_s": r"a_{\rm s}",
+    "Q": r"Q",
+    "gamma": r"\gamma",
+    "maxpdf": r"p_{\rm max}",
+    "n_cen": r"n_{\rm cen}",
+    "n_sat": r"n_{\rm sat}",
+    "number_density": r"n_{\rm g}",
+    "satellite_fraction": r"f_{\rm sat}",
+    "log10_mh_cen_med": r"\log M_{\rm h,cen}^{\rm med}",
+    "log10_mh_sat_med": r"\log M_{\rm h,sat}^{\rm med}",
+    "mh_cen_med": r"M_{\rm h,cen}^{\rm med}",
+    "mh_sat_med": r"M_{\rm h,sat}^{\rm med}",
+    "linear_bias": r"b_{\rm lin}",
+}
 
 
 @dataclass(frozen=True)
@@ -249,22 +270,6 @@ class FitPlotData:
             }
             for name, stat in self.parameter_stats.items()
         }
-
-    def fit_bands(self, **kwargs: Any) -> list[ObservableFitBand]:
-        return fit_bands_from_chain(self, **kwargs)
-
-    def hod_band(self, **kwargs: Any) -> HODBand:
-        return hod_bands_from_chain(self, **kwargs)
-
-    def plot_fit(self, **kwargs: Any):
-        return plot_fit_from_chain(self, **kwargs)
-
-    def plot_hod(self, **kwargs: Any):
-        return plot_hod_from_chain(self, **kwargs)
-
-    def plot_triangle(self, **kwargs: Any):
-        return plot_triangle(self, **kwargs)
-
 
 # -----------------------------------------------------------------------------
 # Config path helpers
@@ -601,7 +606,7 @@ def plot_triangle(
 # Fit observable bands
 
 
-def fit_bands_from_chain(
+def fit_bands_from_fit(
     fit: FitPlotData,
     *,
     max_samples: int | None = None,
@@ -637,7 +642,7 @@ def fit_bands_from_chain(
     return bands
 
 
-def fit_bands_from_chains(
+def fit_bands_from_fits(
     fits: Sequence[FitPlotData],
     *,
     max_samples: int | None = None,
@@ -647,7 +652,7 @@ def fit_bands_from_chains(
     """Evaluate several loaded fits into fit bands."""
 
     return [
-        fit_bands_from_chain(
+        fit_bands_from_fit(
             fit,
             max_samples=max_samples,
             random_state=random_state,
@@ -718,6 +723,7 @@ def plot_fit_bands(
     alpha: float = 0.25,
     show_data: bool = True,
     xscale: str = "log",
+    plot_rp_wp: bool = True,
     max_samples: int | None = None,
     random_state: int | np.random.Generator | None = None,
     quantiles: tuple[float, float] = DEFAULT_BAND_QUANTILES,
@@ -725,7 +731,7 @@ def plot_fit_bands(
     """Plot one or more loaded fits against the measured data vector."""
 
     plt = _matplotlib_pyplot()
-    band_sets = fit_bands_from_chains(
+    band_sets = fit_bands_from_fits(
         _fit_plot_data_list(fits),
         max_samples=max_samples,
         random_state=random_state,
@@ -744,30 +750,46 @@ def plot_fit_bands(
     labels = labels or [None] * len(band_sets)
     for i, ax in enumerate(axes):
         reference = band_sets[0][i]
+        ref_scale = _observable_plot_scale(reference, plot_rp_wp=plot_rp_wp)
         if show_data:
-            ax.errorbar(reference.x, reference.data, yerr=reference.error, fmt="o", color="k", label="data")
+            ax.errorbar(
+                reference.x,
+                reference.data * ref_scale,
+                yerr=reference.error * np.abs(ref_scale),
+                fmt="o",
+                color="k",
+                label="data",
+            )
         for band_set, chain_label in zip(band_sets, labels, strict=True):
             band = band_set[i]
+            scale = _observable_plot_scale(band, plot_rp_wp=plot_rp_wp)
             line_label = chain_label or band.label
-            line = ax.plot(band.x, band.mean, label=line_label)[0]
-            ax.fill_between(band.x, band.lower, band.upper, color=line.get_color(), alpha=alpha, linewidth=0)
+            line = ax.plot(band.x, band.mean * scale, label=line_label)[0]
+            ax.fill_between(
+                band.x,
+                band.lower * scale,
+                band.upper * scale,
+                color=line.get_color(),
+                alpha=alpha,
+                linewidth=0,
+            )
         if xscale and np.all(reference.x > 0.0):
             ax.set_xscale(xscale)
         ax.set_xlabel(_observable_x_label(reference.statistic), fontsize=labelsize)
-        ax.set_ylabel(_observable_y_label(reference.statistic), fontsize=labelsize)
+        ax.set_ylabel(_observable_y_label(reference.statistic, plot_rp_wp=plot_rp_wp), fontsize=labelsize)
         ax.set_title(reference.name, fontsize=labelsize)
         _style_axis(ax, ticksize=ticksize, legendsize=legendsize)
     fig.tight_layout()
     return fig, axes
 
 
-def plot_fit_from_chain(fit: FitPlotData, **kwargs: Any):
+def plot_fit(fit: FitPlotData, **kwargs: Any):
     """Compute and plot fit bands for one loaded fit."""
 
     return plot_fit_bands(fit, **kwargs)
 
 
-def plot_fit_from_chains(fits: Sequence[FitPlotData], **kwargs: Any):
+def plot_fits(fits: Sequence[FitPlotData], **kwargs: Any):
     """Compute and plot overlaid fit bands for several loaded fits."""
 
     return plot_fit_bands(fits, **kwargs)
@@ -792,14 +814,14 @@ def plot_fit_from_config(
         validate=validate,
         build_getdist=False,
     )
-    return plot_fit_from_chain(plot_data, **kwargs)
+    return plot_fit(plot_data, **kwargs)
 
 
 # -----------------------------------------------------------------------------
 # HOD bands
 
 
-def hod_bands_from_chain(
+def hod_bands_from_fit(
     fit: FitPlotData,
     *,
     tracer: str | None = None,
@@ -848,10 +870,10 @@ def hod_bands_from_chain(
     )
 
 
-def hod_bands_from_chains(fits: Sequence[FitPlotData], **kwargs: Any) -> list[HODBand]:
+def hod_bands_from_fits(fits: Sequence[FitPlotData], **kwargs: Any) -> list[HODBand]:
     """Evaluate HOD bands for several loaded fits."""
 
-    return [hod_bands_from_chain(fit, **kwargs) for fit in _fit_plot_data_list(fits)]
+    return [hod_bands_from_fit(fit, **kwargs) for fit in _fit_plot_data_list(fits)]
 
 
 def plot_hod_bands(
@@ -864,7 +886,7 @@ def plot_hod_bands(
     legendsize: int = DEFAULT_LEGENDSIZE,
     ticksize: int = DEFAULT_TICKSIZE,
     alpha: float = 0.25,
-    yscale: str | None = None,
+    yscale: str | None = "log",
     tracer: str | None = None,
     logm: np.ndarray | None = None,
     hod_model: str | None = None,
@@ -875,7 +897,7 @@ def plot_hod_bands(
     """Plot HOD occupation bands for one or several loaded fits."""
 
     plt = _matplotlib_pyplot()
-    band_list = hod_bands_from_chains(
+    band_list = hod_bands_from_fits(
         _fit_plot_data_list(fits),
         tracer=tracer,
         logm=logm,
@@ -893,6 +915,7 @@ def plot_hod_bands(
         base_label = chain_label or band.label or band.tracer
         for component in components:
             mean, lower, upper = _hod_component_arrays(band, component)
+            mean, lower, upper = _hod_plot_values(mean, lower, upper, yscale=yscale)
             line = ax.plot(
                 band.logm,
                 mean,
@@ -909,13 +932,13 @@ def plot_hod_bands(
     return fig, ax
 
 
-def plot_hod_from_chain(fit: FitPlotData, **kwargs: Any):
+def plot_hod(fit: FitPlotData, **kwargs: Any):
     """Compute and plot HOD bands for one loaded fit."""
 
     return plot_hod_bands(fit, **kwargs)
 
 
-def plot_hod_from_chains(fits: Sequence[FitPlotData], **kwargs: Any):
+def plot_hods(fits: Sequence[FitPlotData], **kwargs: Any):
     """Compute and plot overlaid HOD bands for several loaded fits."""
 
     return plot_hod_bands(fits, **kwargs)
@@ -1157,9 +1180,12 @@ def _getdist_selection(chain: ChainSamples, params: Sequence[str] | None) -> _Ge
 def _selected_label_map(names: Sequence[str], labels: Mapping[str, str] | Sequence[str] | None) -> dict[str, str]:
     selected = tuple(str(item) for item in names)
     if labels is None:
-        return {name: name for name in selected}
+        return {name: _default_parameter_label(name) for name in selected}
     if isinstance(labels, Mapping):
-        return {name: str(labels.get(name, name)) for name in selected}
+        return {
+            name: str(labels.get(name, labels.get(_parameter_label_key(name), _default_parameter_label(name))))
+            for name in selected
+        }
     if len(labels) != len(selected):
         raise ValueError("Label list must match the number of selected parameters.")
     return {name: str(label) for name, label in zip(selected, labels, strict=True)}
@@ -1271,9 +1297,39 @@ def _observable_x_label(statistic: str) -> str:
     return r"$r_p\,[h^{-1}{\rm Mpc}]$" if statistic == "wp" else r"$s\,[h^{-1}{\rm Mpc}]$"
 
 
-def _observable_y_label(statistic: str) -> str:
+def _observable_y_label(statistic: str, *, plot_rp_wp: bool = True) -> str:
+    if statistic == "wp" and plot_rp_wp:
+        return r"$r_p w_p(r_p)$"
     labels = {"wp": r"$w_p(r_p)$", "xi0": r"$\xi_0(s)$", "xi2": r"$\xi_2(s)$"}
     return labels.get(statistic, statistic)
+
+
+def _observable_plot_scale(band: ObservableFitBand, *, plot_rp_wp: bool) -> np.ndarray | float:
+    if band.statistic == "wp" and plot_rp_wp:
+        return band.x
+    return 1.0
+
+
+def _parameter_label_key(name: str) -> str:
+    return str(name).split(".")[-1]
+
+
+def _default_parameter_label(name: str) -> str:
+    key = _parameter_label_key(name)
+    return DEFAULT_PARAMETER_LABELS.get(key, str(name))
+
+
+def _hod_plot_values(
+    mean: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    *,
+    yscale: str | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if str(yscale).lower() != "log":
+        return mean, lower, upper
+    floor = 1.0e-8
+    return np.clip(mean, floor, None), np.clip(lower, floor, None), np.clip(upper, floor, None)
 
 
 def _hod_component_arrays(band: HODBand, component: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
