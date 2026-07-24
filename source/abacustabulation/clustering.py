@@ -9,7 +9,8 @@ from typing import Any, Mapping
 import h5py
 import numpy as np
 
-from .hod import evaluate_hod
+from .hod import evaluate_hod, evaluate_hod_splits
+from .hod_models.lrg_stellar_mass import normalize_stellar_mass_selection
 
 
 @dataclass
@@ -54,6 +55,50 @@ class GalaxyClusteringResult:
     weights_b: HODBinWeights | None = None
     n_galaxies_b: float | None = None
     number_density_b: float | None = None
+
+
+@dataclass
+class StellarMassClusteringResult:
+    """Auto-clustering results for every stellar-mass split in edge order."""
+
+    clusterings: tuple[GalaxyClusteringResult, ...]
+    split_method: str
+    logmstar_edges: np.ndarray
+    redshift_weights: np.ndarray
+
+    def __len__(self) -> int:
+        return len(self.clusterings)
+
+    def __getitem__(self, index: int) -> GalaxyClusteringResult:
+        return self.clusterings[index]
+
+    @property
+    def n_splits(self) -> int:
+        return len(self.clusterings)
+
+    @property
+    def xi(self) -> np.ndarray:
+        return np.stack([result.xi for result in self.clusterings], axis=0)
+
+    @property
+    def dd(self) -> np.ndarray:
+        return np.stack([result.dd for result in self.clusterings], axis=0)
+
+    @property
+    def rr(self) -> np.ndarray:
+        return np.stack([result.rr for result in self.clusterings], axis=0)
+
+    @property
+    def weights(self) -> tuple[HODBinWeights, ...]:
+        return tuple(result.weights for result in self.clusterings)
+
+    @property
+    def n_galaxies(self) -> np.ndarray:
+        return np.asarray([result.n_galaxies for result in self.clusterings])
+
+    @property
+    def number_density(self) -> np.ndarray:
+        return np.asarray([result.number_density for result in self.clusterings])
 
 
 def _decode_attr(value: Any) -> Any:
@@ -162,6 +207,105 @@ def _hod_weights_from_subcenters(
         n_centrals=n_centrals,
         n_satellites=n_satellites,
         subbin_weighting="halo_count",
+    )
+
+
+def _stellar_mass_weights_from_subcenters(
+    mass_edges_log10: np.ndarray,
+    mass_subcenters_log10: np.ndarray,
+    num_halo: np.ndarray,
+    num_particle: np.ndarray,
+    hod_params: Mapping[str, Any],
+    *,
+    hod_model: str,
+    split_method: str,
+    logmstar_edges: Any,
+    redshift_weights: Any,
+    num_halo_subbin: np.ndarray,
+) -> tuple[HODBinWeights, ...]:
+    """Build halo-count-weighted HOD weights for every stellar-mass split."""
+
+    edges = np.asarray(mass_edges_log10, dtype=np.float64)
+    subcenters = np.asarray(mass_subcenters_log10, dtype=np.float64)
+    num_halo = np.asarray(num_halo, dtype=np.float64)
+    num_particle = np.asarray(num_particle, dtype=np.float64)
+    counts = np.asarray(num_halo_subbin, dtype=np.float64)
+    if counts.shape != subcenters.shape:
+        raise ValueError(
+            f"num_halo_subbin shape {counts.shape} does not match HOD "
+            f"subcenters {subcenters.shape}."
+        )
+    sub_totals = np.sum(counts, axis=1)
+    if not np.allclose(sub_totals, num_halo):
+        raise ValueError(
+            "num_halo_subbin does not sum to the coarse mass-bin num_halo values."
+        )
+
+    central_sub, satellite_sub = evaluate_hod_splits(
+        10.0**subcenters,
+        hod_params,
+        model=hod_model,
+        split_method=split_method,
+        logmstar_edges=logmstar_edges,
+        redshift_weights=redshift_weights,
+    )
+    central_sub = np.asarray(central_sub, dtype=np.float64)
+    satellite_sub = np.asarray(satellite_sub, dtype=np.float64)
+    expected_tail = subcenters.shape
+    if (
+        central_sub.ndim != subcenters.ndim + 1
+        or central_sub.shape[1:] != expected_tail
+        or satellite_sub.shape != central_sub.shape
+    ):
+        raise ValueError(
+            "Split HOD occupations must have shape "
+            f"(n_splits, {expected_tail}), got central {central_sub.shape} "
+            f"and satellite {satellite_sub.shape}."
+        )
+    if (
+        not np.all(np.isfinite(central_sub))
+        or not np.all(np.isfinite(satellite_sub))
+        or np.any(central_sub < 0.0)
+        or np.any(satellite_sub < 0.0)
+    ):
+        raise ValueError("Split HOD occupations must be finite and non-negative.")
+
+    weighted_counts = counts[None, ...]
+    denominator = sub_totals[None, :]
+    central = np.divide(
+        np.sum(central_sub * weighted_counts, axis=2),
+        denominator,
+        out=np.zeros((central_sub.shape[0], subcenters.shape[0]), dtype=np.float64),
+        where=denominator > 0.0,
+    )
+    satellite = np.divide(
+        np.sum(satellite_sub * weighted_counts, axis=2),
+        denominator,
+        out=np.zeros_like(central),
+        where=denominator > 0.0,
+    )
+    particle = np.divide(
+        satellite * num_halo[None, :],
+        num_particle[None, :],
+        out=np.zeros_like(satellite),
+        where=num_particle[None, :] > 0.0,
+    )
+    n_centrals = central @ num_halo
+    n_satellites = satellite @ num_halo
+
+    return tuple(
+        HODBinWeights(
+            central=central[index],
+            satellite=satellite[index],
+            particle=particle[index],
+            mass_edges_log10=edges,
+            mass_subcenters_log10=subcenters,
+            n_galaxies=float(n_centrals[index] + n_satellites[index]),
+            n_centrals=float(n_centrals[index]),
+            n_satellites=float(n_satellites[index]),
+            subbin_weighting="halo_count",
+        )
+        for index in range(central.shape[0])
     )
 
 
@@ -362,6 +506,111 @@ class HODClusteringTabulator:
             num_halo_subbin=self.num_halo_subbin,
         )
 
+    def stellar_mass_hod_weights(
+        self,
+        hod_params: Mapping[str, Any],
+        *,
+        split_method: str,
+        logmstar_edges: Any,
+        redshift_weights: Any = None,
+        hod_model: str = "lrg_stellar_mass",
+    ) -> tuple[HODBinWeights, ...]:
+        """Return HOD weights for all raw or relative stellar-mass splits."""
+
+        return _stellar_mass_weights_from_subcenters(
+            self.paircounts.mass_edges_log10,
+            self.mass_subcenters_log10,
+            self.paircounts.num_halo,
+            self.paircounts.num_particle,
+            hod_params,
+            hod_model=hod_model,
+            split_method=split_method,
+            logmstar_edges=logmstar_edges,
+            redshift_weights=redshift_weights,
+            num_halo_subbin=self.num_halo_subbin,
+        )
+
+    def _weighted_auto_paircounts_batch(
+        self,
+        weights: tuple[HODBinWeights, ...],
+    ) -> np.ndarray:
+        if not weights:
+            raise ValueError("At least one stellar-mass split is required.")
+        central = np.stack([item.central for item in weights], axis=0)
+        particle = np.stack([item.particle for item in weights], axis=0)
+        w_hh = (central[:, :, None] * central[:, None, :]).reshape(len(weights), -1)
+        w_hp = (2.0 * central[:, :, None] * particle[:, None, :]).reshape(
+            len(weights), -1
+        )
+        w_pp = (particle[:, :, None] * particle[:, None, :]).reshape(len(weights), -1)
+        dd = w_hh @ self._hh + w_hp @ self._hp + w_pp @ self._pp
+        return dd.reshape((len(weights), *self.bin_shape))
+
+    def stellar_mass_correlations(
+        self,
+        hod_params: Mapping[str, Any],
+        *,
+        split_method: str,
+        logmstar_edges: Any,
+        redshift_weights: Any = None,
+        hod_model: str = "lrg_stellar_mass",
+    ) -> StellarMassClusteringResult:
+        """Return auto-clustering for every stellar-mass split in edge order."""
+
+        normalized_edges, normalized_redshift_weights = (
+            normalize_stellar_mass_selection(
+                split_method,
+                logmstar_edges,
+                redshift_weights,
+            )
+        )
+        weights = self.stellar_mass_hod_weights(
+            hod_params,
+            split_method=split_method,
+            logmstar_edges=logmstar_edges,
+            redshift_weights=redshift_weights,
+            hod_model=hod_model,
+        )
+        expected_splits = normalized_edges.shape[1] - 1
+        if len(weights) != expected_splits:
+            raise ValueError(
+                f"The HOD returned {len(weights)} splits for {expected_splits} intervals."
+            )
+
+        dd = self._weighted_auto_paircounts_batch(weights)
+        n_galaxies = np.asarray([item.n_galaxies for item in weights])
+        normalization_shape = (len(weights),) + (1,) * len(self.bin_shape)
+        rr = (n_galaxies**2).reshape(normalization_shape) * self.random_geometry[None, ...]
+        xi = np.divide(
+            dd,
+            rr,
+            out=np.full_like(dd, np.nan, dtype=np.float64),
+            where=rr > 0.0,
+        ) - 1.0
+        box_volume = float(self.paircounts.attrs["boxsize"]) ** 3
+        clusterings = tuple(
+            GalaxyClusteringResult(
+                xi=xi[index],
+                dd=dd[index],
+                rr=rr[index],
+                weights=weights[index],
+                paircounts=self.paircounts,
+                n_galaxies=float(n_galaxies[index]),
+                number_density=float(n_galaxies[index] / box_volume),
+            )
+            for index in range(len(weights))
+        )
+        normalized_method = str(split_method).lower()
+        output_edges = (
+            normalized_edges[0] if normalized_method == "raw" else normalized_edges
+        )
+        return StellarMassClusteringResult(
+            clusterings=clusterings,
+            split_method=normalized_method,
+            logmstar_edges=output_edges,
+            redshift_weights=normalized_redshift_weights,
+        )
+
     def weighted_paircounts(
         self,
         weights_a: HODBinWeights,
@@ -442,6 +691,27 @@ def galaxy_correlation_from_paircounts(
 
     tabulator = HODClusteringTabulator.from_paircount_file(paircount_path)
     return tabulator.correlation(hod_params, hod_model=hod_model)
+
+
+def stellar_mass_correlations_from_paircounts(
+    paircount_path: str | Path,
+    hod_params: Mapping[str, Any],
+    *,
+    split_method: str,
+    logmstar_edges: Any,
+    redshift_weights: Any = None,
+    hod_model: str = "lrg_stellar_mass",
+) -> StellarMassClusteringResult:
+    """Load one paircount table and evaluate every stellar-mass split."""
+
+    tabulator = HODClusteringTabulator.from_paircount_file(paircount_path)
+    return tabulator.stellar_mass_correlations(
+        hod_params,
+        split_method=split_method,
+        logmstar_edges=logmstar_edges,
+        redshift_weights=redshift_weights,
+        hod_model=hod_model,
+    )
 
 
 def galaxy_cross_correlation_from_paircounts(

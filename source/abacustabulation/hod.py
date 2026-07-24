@@ -26,6 +26,7 @@ from .hod_models.base import (
 
 
 HODEvaluator = Callable[[np.ndarray, Mapping[str, Any]], tuple[np.ndarray, np.ndarray]]
+HODSplitEvaluator = Callable[..., tuple[np.ndarray, np.ndarray]]
 _SKIPPED_MODULES = {"base"}
 
 
@@ -39,9 +40,14 @@ def _iter_model_modules() -> tuple[tuple[str, ModuleType], ...]:
     return tuple(sorted(modules, key=lambda item: item[0]))
 
 
-def _load_models() -> tuple[dict[str, HODEvaluator], dict[str, set[str]]]:
+def _load_models() -> tuple[
+    dict[str, HODEvaluator],
+    dict[str, set[str]],
+    dict[str, HODSplitEvaluator],
+]:
     models: dict[str, HODEvaluator] = {}
     model_parameters: dict[str, set[str]] = {}
+    split_models: dict[str, HODSplitEvaluator] = {}
     for name, module in _iter_model_modules():
         evaluator = getattr(module, "evaluate", None)
         parameters = getattr(module, "PARAMETERS", None)
@@ -51,10 +57,13 @@ def _load_models() -> tuple[dict[str, HODEvaluator], dict[str, set[str]]]:
             )
         models[name] = evaluator
         model_parameters[name] = set(parameters)
-    return models, model_parameters
+        split_evaluator = getattr(module, "evaluate_all_splits", None)
+        if callable(split_evaluator):
+            split_models[name] = split_evaluator
+    return models, model_parameters, split_models
 
 
-HOD_MODELS, HOD_MODEL_PARAMETERS = _load_models()
+HOD_MODELS, HOD_MODEL_PARAMETERS, HOD_SPLIT_MODELS = _load_models()
 
 
 def _model_key(model: str) -> str:
@@ -85,6 +94,30 @@ def hod_model_parameters(model: str) -> tuple[str, ...]:
     """Return accepted canonical parameter names for one HOD model."""
 
     return tuple(sorted(HOD_MODEL_PARAMETERS[_model_key(model)]))
+
+
+def evaluate_hod_splits(
+    mass: np.ndarray | float,
+    params: Mapping[str, Any],
+    *,
+    model: str = "lrg_stellar_mass",
+    split_method: str,
+    logmstar_edges: Any,
+    redshift_weights: Any = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return all occupations from a split-capable HOD model."""
+
+    model_key = _model_key(model)
+    if model_key not in HOD_SPLIT_MODELS:
+        raise ValueError(f"HOD model {model!r} does not provide split occupations.")
+    _validate_params(model_key, params)
+    return HOD_SPLIT_MODELS[model_key](
+        np.asarray(mass, dtype=np.float64),
+        params,
+        split_method=split_method,
+        logmstar_edges=logmstar_edges,
+        redshift_weights=redshift_weights,
+    )
 
 
 def evaluate_hod(

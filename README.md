@@ -53,6 +53,22 @@ Set `paircounts.jobs.clustering.position_dataset: pos_rsd` if the fitted cluster
 
 Avoid global CLI overrides like `--position-dataset pos_rsd` when computing both default jobs, because the linear-bias job must remain real space.
 
+### Evaluate Stellar-Mass Splits
+
+```python
+from abacustabulation import HODClusteringTabulator, projected_wp
+
+tabulator = HODClusteringTabulator.from_paircount_file(paircount_path)
+result = tabulator.stellar_mass_correlations(
+    hod_params,
+    split_method="raw",
+    logmstar_edges=[10.4, 11.05, 11.30, 11.55, 12.2],
+)
+wp_by_split = [projected_wp(item) for item in result.clusterings]
+```
+
+For `split_method="relative"`, pass a two-dimensional edge array with one row per redshift cell. `redshift_weights=None` gives all cells equal weight; explicit non-negative weights are normalized internally. The model evaluates all splits together and returns them in edge order.
+
 ## 4. Compute the High-Resolution HMF
 
 Run this before using HMF number-density constraints or derived HOD quantities.
