@@ -69,6 +69,23 @@ wp_by_split = [projected_wp(item) for item in result.clusterings]
 
 For `split_method="relative"`, pass a two-dimensional edge array with one row per redshift cell. `redshift_weights=None` gives all cells equal weight; explicit non-negative weights are normalized internally. The model evaluates all splits together and returns them in edge order.
 
+The separate `configs/lrg_stellar_mass_override.yaml` inherits the same base config as the scalar LRG override. It stores the split definition once under `hod.stellar_mass`; HMF and linear-bias derived quantities reuse it:
+
+```python
+from abacustabulation import HODDerivedTabulator, load_config
+
+config_path = "configs/lrg_stellar_mass_override.yaml"
+config = load_config(config_path)
+derived = HODDerivedTabulator.from_config(config, tracer="LRG")
+result = derived.evaluate_stellar_mass(config["hod"]["params"])
+
+print(result.values["number_density"])
+print(result.values["satellite_fraction"])
+print(result.values["linear_bias"])
+```
+
+MCMC postprocessing writes split columns as `LRG.sm0.number_density`, `LRG.sm0.linear_bias`, and so on. The dedicated override contains a simultaneous four-split `wp` fit example. `fit.theory.tracers.LRG.stellar_mass.samples` maps stable sample names to edge-interval indices, while each observable and data block uses the corresponding `sample` name.
+
 ## 4. Compute the High-Resolution HMF
 
 Run this before using HMF number-density constraints or derived HOD quantities.
@@ -90,6 +107,7 @@ pocoMC:
 ```bash
 python3 scripts/run_fit_pocomc.py --path2config configs/my_run.yaml
 python3 scripts/run_fit_pocomc.py --path2config configs/my_run.yaml --n-processes 8
+python3 scripts/run_fit_pocomc_stellar_mass.py --path2config configs/lrg_stellar_mass_override.yaml --n-processes 8
 ```
 
 Use `fit.mcmc.pocomc.use_mpi: true` for MPI runs, or `fit.mcmc.pocomc.n_processes > 1` for local multiprocessing on one node.

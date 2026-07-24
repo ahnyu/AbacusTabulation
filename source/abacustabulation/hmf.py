@@ -10,7 +10,7 @@ from typing import Any, Mapping
 import h5py
 import numpy as np
 
-from .hod import evaluate_hod
+from .hod import evaluate_hod, evaluate_hod_splits
 from .paircounts import find_prepared_file_pairs, parse_logm_edges
 
 
@@ -482,17 +482,17 @@ def hmf_density_weights(hmf: HaloMassFunction) -> np.ndarray:
 
 def _warn_if_hmf_edges_contribute(hmf: HaloMassFunction, occupation: np.ndarray) -> None:
     weights = np.asarray(occupation, dtype=np.float64) * hmf_density_weights(hmf)
-    if weights.size == 0:
+    if weights.size == 0 or weights.shape[-1] == 0:
         return
-    finite = np.isfinite(weights)
-    if not np.any(finite):
+    rows = weights.reshape(-1, weights.shape[-1])
+    finite_weights = np.where(np.isfinite(rows), rows, 0.0)
+    totals = np.sum(finite_weights, axis=1)
+    valid = totals > 0.0
+    if not np.any(valid):
         return
-    total = float(np.sum(weights[finite]))
-    if total <= 0.0:
-        return
-    lower = float(weights[0] / total) if np.isfinite(weights[0]) else 0.0
-    upper = float(weights[-1] / total) if np.isfinite(weights[-1]) else 0.0
-    if max(lower, upper) > _HMF_EDGE_FRACTION_WARN:
+    edge_fraction = np.maximum(finite_weights[:, 0], finite_weights[:, -1])
+    edge_fraction[valid] /= totals[valid]
+    if np.any(edge_fraction[valid] > _HMF_EDGE_FRACTION_WARN):
         warnings.warn(
             "The first or last HMF bin contributes more than 0.1% of the HOD number density. "
             "Consider widening hmf.logm_min/hmf.logm_max for derived quantities.",
@@ -515,6 +515,116 @@ def hod_occupation_on_hmf(
     sat = np.asarray(sat, dtype=np.float64)
     _warn_if_hmf_edges_contribute(hmf, cen + sat)
     return cen, sat
+
+
+def stellar_mass_hod_occupations_on_hmf(
+    hmf: HaloMassFunction,
+    hod_params: Mapping[str, Any],
+    *,
+    split_method: str,
+    logmstar_edges: Any,
+    redshift_weights: Any = None,
+    hod_model: str = "lrg_stellar_mass",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Evaluate every stellar-mass split on the HMF bin centers."""
+
+    mass = 10.0 ** np.asarray(hmf.logm_centers, dtype=np.float64)
+    central, satellite = evaluate_hod_splits(
+        mass,
+        hod_params,
+        model=hod_model,
+        split_method=split_method,
+        logmstar_edges=logmstar_edges,
+        redshift_weights=redshift_weights,
+    )
+    central = np.asarray(central, dtype=np.float64)
+    satellite = np.asarray(satellite, dtype=np.float64)
+    expected_tail = (hmf.logm_centers.size,)
+    if (
+        central.ndim != 2
+        or central.shape[1:] != expected_tail
+        or satellite.shape != central.shape
+    ):
+        raise ValueError(
+            "Stellar-mass HOD occupations must have shape "
+            f"(n_splits, {expected_tail[0]}), got central {central.shape} "
+            f"and satellite {satellite.shape}."
+        )
+    if (
+        not np.all(np.isfinite(central))
+        or not np.all(np.isfinite(satellite))
+        or np.any(central < 0.0)
+        or np.any(satellite < 0.0)
+    ):
+        raise ValueError("Stellar-mass HOD occupations must be finite and non-negative.")
+    _warn_if_hmf_edges_contribute(hmf, central + satellite)
+    return central, satellite
+
+
+def _number_densities_from_occupations(
+    hmf: HaloMassFunction,
+    occupation: np.ndarray,
+) -> np.ndarray:
+    return np.sum(
+        np.asarray(occupation, dtype=np.float64) * hmf_density_weights(hmf),
+        axis=-1,
+    )
+
+
+def stellar_mass_hod_central_number_densities(
+    hmf: HaloMassFunction,
+    hod_params: Mapping[str, Any],
+    **split_options: Any,
+) -> np.ndarray:
+    """Return central number density for every stellar-mass split."""
+
+    central, _ = stellar_mass_hod_occupations_on_hmf(hmf, hod_params, **split_options)
+    return _number_densities_from_occupations(hmf, central)
+
+
+def stellar_mass_hod_satellite_number_densities(
+    hmf: HaloMassFunction,
+    hod_params: Mapping[str, Any],
+    **split_options: Any,
+) -> np.ndarray:
+    """Return satellite number density for every stellar-mass split."""
+
+    _, satellite = stellar_mass_hod_occupations_on_hmf(hmf, hod_params, **split_options)
+    return _number_densities_from_occupations(hmf, satellite)
+
+
+def stellar_mass_hod_number_densities(
+    hmf: HaloMassFunction,
+    hod_params: Mapping[str, Any],
+    **split_options: Any,
+) -> np.ndarray:
+    """Return total number density for every stellar-mass split."""
+
+    central, satellite = stellar_mass_hod_occupations_on_hmf(
+        hmf, hod_params, **split_options
+    )
+    return _number_densities_from_occupations(hmf, central + satellite)
+
+
+def stellar_mass_hod_satellite_fractions(
+    hmf: HaloMassFunction,
+    hod_params: Mapping[str, Any],
+    **split_options: Any,
+) -> np.ndarray:
+    """Return satellite fraction for every stellar-mass split."""
+
+    central, satellite = stellar_mass_hod_occupations_on_hmf(
+        hmf, hod_params, **split_options
+    )
+    n_cen = _number_densities_from_occupations(hmf, central)
+    n_sat = _number_densities_from_occupations(hmf, satellite)
+    total = n_cen + n_sat
+    return np.divide(
+        n_sat,
+        total,
+        out=np.full_like(total, np.nan, dtype=np.float64),
+        where=total > 0.0,
+    )
 
 
 def hod_central_number_density(
@@ -567,24 +677,55 @@ def hod_satellite_fraction(
     return float(n_sat / total) if total > 0.0 else np.nan
 
 
+def _weighted_median_log10_host_masses(
+    hmf: HaloMassFunction,
+    occupations: np.ndarray,
+) -> np.ndarray:
+    occupations = np.asarray(occupations, dtype=np.float64)
+    if occupations.ndim != 2 or occupations.shape[1] != hmf.logm_centers.size:
+        raise ValueError(
+            "occupations must have shape "
+            f"(n_samples, {hmf.logm_centers.size}), got {occupations.shape}."
+        )
+    weights = occupations * hmf_density_weights(hmf)[None, :]
+    totals = np.sum(weights, axis=1)
+    result = np.full(occupations.shape[0], np.nan, dtype=np.float64)
+    valid = totals > 0.0
+    if not np.any(valid):
+        return result
+
+    cumulative = np.cumsum(weights[valid], axis=1)
+    targets = 0.5 * totals[valid]
+    indices = np.sum(cumulative < targets[:, None], axis=1)
+    indices = np.minimum(indices, weights.shape[1] - 1)
+    rows = np.arange(indices.size)
+    previous = np.where(indices == 0, 0.0, cumulative[rows, np.maximum(indices - 1, 0)])
+    current = weights[valid][rows, indices]
+    fraction = np.divide(
+        targets - previous,
+        current,
+        out=np.zeros_like(targets),
+        where=current > 0.0,
+    )
+    fraction = np.clip(fraction, 0.0, 1.0)
+    interpolated = hmf.logm_edges[indices] + fraction * (
+        hmf.logm_edges[indices + 1] - hmf.logm_edges[indices]
+    )
+    interpolated = np.where(
+        current > 0.0,
+        interpolated,
+        hmf.logm_centers[indices],
+    )
+    result[valid] = interpolated
+    return result
+
+
 def _weighted_median_log10_host_mass(
     hmf: HaloMassFunction,
     occupation: np.ndarray,
 ) -> float:
-    weights = np.asarray(occupation, dtype=np.float64) * hmf_density_weights(hmf)
-    total = float(np.sum(weights))
-    if total <= 0.0:
-        return float("nan")
-    target = 0.5 * total
-    cumulative = np.cumsum(weights)
-    index = int(np.searchsorted(cumulative, target, side="left"))
-    index = min(index, len(weights) - 1)
-    previous = 0.0 if index == 0 else float(cumulative[index - 1])
-    current = float(weights[index])
-    if current <= 0.0:
-        return float(hmf.logm_centers[index])
-    fraction = np.clip((target - previous) / current, 0.0, 1.0)
-    return float(hmf.logm_edges[index] + fraction * (hmf.logm_edges[index + 1] - hmf.logm_edges[index]))
+    occupation = np.asarray(occupation, dtype=np.float64).reshape(1, -1)
+    return float(_weighted_median_log10_host_masses(hmf, occupation)[0])
 
 
 def hod_central_median_log10_host_mass(
@@ -611,6 +752,28 @@ def hod_satellite_median_log10_host_mass(
     return _weighted_median_log10_host_mass(hmf, sat)
 
 
+def stellar_mass_hod_central_median_log10_host_masses(
+    hmf: HaloMassFunction,
+    hod_params: Mapping[str, Any],
+    **split_options: Any,
+) -> np.ndarray:
+    """Return median log10 central host mass for every stellar-mass split."""
+
+    central, _ = stellar_mass_hod_occupations_on_hmf(hmf, hod_params, **split_options)
+    return _weighted_median_log10_host_masses(hmf, central)
+
+
+def stellar_mass_hod_satellite_median_log10_host_masses(
+    hmf: HaloMassFunction,
+    hod_params: Mapping[str, Any],
+    **split_options: Any,
+) -> np.ndarray:
+    """Return median log10 satellite host mass for every stellar-mass split."""
+
+    _, satellite = stellar_mass_hod_occupations_on_hmf(hmf, hod_params, **split_options)
+    return _weighted_median_log10_host_masses(hmf, satellite)
+
+
 def hod_central_median_host_mass(
     hmf: HaloMassFunction,
     hod_params: Mapping[str, Any],
@@ -633,6 +796,32 @@ def hod_satellite_median_host_mass(
     return float(10.0 ** hod_satellite_median_log10_host_mass(hmf, hod_params, hod_model=hod_model))
 
 
+def stellar_mass_hod_central_median_host_masses(
+    hmf: HaloMassFunction,
+    hod_params: Mapping[str, Any],
+    **split_options: Any,
+) -> np.ndarray:
+    """Return median central host mass for every stellar-mass split."""
+
+    log10_mass = stellar_mass_hod_central_median_log10_host_masses(
+        hmf, hod_params, **split_options
+    )
+    return np.where(np.isfinite(log10_mass), 10.0**log10_mass, np.nan)
+
+
+def stellar_mass_hod_satellite_median_host_masses(
+    hmf: HaloMassFunction,
+    hod_params: Mapping[str, Any],
+    **split_options: Any,
+) -> np.ndarray:
+    """Return median satellite host mass for every stellar-mass split."""
+
+    log10_mass = stellar_mass_hod_satellite_median_log10_host_masses(
+        hmf, hod_params, **split_options
+    )
+    return np.where(np.isfinite(log10_mass), 10.0**log10_mass, np.nan)
+
+
 @dataclass(frozen=True)
 class HODDerivedQuantities:
     n_cen: float
@@ -643,6 +832,18 @@ class HODDerivedQuantities:
     log10_mh_sat_med: float
     mh_cen_med: float
     mh_sat_med: float
+
+
+@dataclass(frozen=True)
+class StellarMassHODDerivedQuantities:
+    n_cen: np.ndarray
+    n_sat: np.ndarray
+    n_gal: np.ndarray
+    f_sat: np.ndarray
+    log10_mh_cen_med: np.ndarray
+    log10_mh_sat_med: np.ndarray
+    mh_cen_med: np.ndarray
+    mh_sat_med: np.ndarray
 
 
 def hod_derived_quantities(
@@ -667,4 +868,46 @@ def hod_derived_quantities(
         log10_mh_sat_med=log10_sat,
         mh_cen_med=float(10.0**log10_cen) if np.isfinite(log10_cen) else np.nan,
         mh_sat_med=float(10.0**log10_sat) if np.isfinite(log10_sat) else np.nan,
+    )
+
+
+def stellar_mass_hod_derived_quantities(
+    hmf: HaloMassFunction,
+    hod_params: Mapping[str, Any],
+    *,
+    split_method: str,
+    logmstar_edges: Any,
+    redshift_weights: Any = None,
+    hod_model: str = "lrg_stellar_mass",
+) -> StellarMassHODDerivedQuantities:
+    """Return common HMF-derived quantities for every stellar-mass split."""
+
+    central, satellite = stellar_mass_hod_occupations_on_hmf(
+        hmf,
+        hod_params,
+        split_method=split_method,
+        logmstar_edges=logmstar_edges,
+        redshift_weights=redshift_weights,
+        hod_model=hod_model,
+    )
+    n_cen = _number_densities_from_occupations(hmf, central)
+    n_sat = _number_densities_from_occupations(hmf, satellite)
+    n_gal = n_cen + n_sat
+    f_sat = np.divide(
+        n_sat,
+        n_gal,
+        out=np.full_like(n_gal, np.nan, dtype=np.float64),
+        where=n_gal > 0.0,
+    )
+    log10_cen = _weighted_median_log10_host_masses(hmf, central)
+    log10_sat = _weighted_median_log10_host_masses(hmf, satellite)
+    return StellarMassHODDerivedQuantities(
+        n_cen=n_cen,
+        n_sat=n_sat,
+        n_gal=n_gal,
+        f_sat=f_sat,
+        log10_mh_cen_med=log10_cen,
+        log10_mh_sat_med=log10_sat,
+        mh_cen_med=np.where(np.isfinite(log10_cen), 10.0**log10_cen, np.nan),
+        mh_sat_med=np.where(np.isfinite(log10_sat), 10.0**log10_sat, np.nan),
     )

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Run pocoMC using the config-driven tabulated HOD likelihood."""
+"""Run pocoMC for a simultaneous stellar-mass-split HOD fit."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ if str(SOURCE_DIR) not in sys.path:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run pocoMC for tabulated HOD fitting."
+        description="Run pocoMC for stellar-mass-split tabulated HOD fitting."
     )
     parser.add_argument(
         "--path2config",
@@ -54,10 +54,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
-    from abacustabulation.fitting import load_fitting_problem_from_config
+    from abacustabulation.fitting import (
+        load_stellar_mass_fitting_problem_from_config,
+    )
     from abacustabulation.pocomc_runner import run_pocomc
 
-    problem = load_fitting_problem_from_config(
+    problem = load_stellar_mass_fitting_problem_from_config(
         args.path2config,
         validate=not args.no_validate,
     )

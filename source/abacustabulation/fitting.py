@@ -14,11 +14,14 @@ from .hmf import (
     find_hmf_file,
     hod_number_density,
     read_hmf,
+    stellar_mass_hod_number_densities,
     validate_hmf_file_for_config,
 )
+from .hod_models.lrg_stellar_mass import normalize_stellar_mass_selection
 
 
 ArrayLike = np.ndarray | Sequence[float]
+DensityKey = tuple[str, str | None]
 _SUPPORTED_STATISTICS = {"wp", "xi0", "xi2"}
 _SMU_STATISTICS = {"xi0", "xi2"}
 
@@ -48,10 +51,16 @@ class ObservableSpec:
     paircount_path: Path
     hod_model: str
     selection: Any = None
+    sample: str | None = None
+    split_index: int | None = None
 
     @property
     def key(self) -> str:
-        return f"{self.tracer}.{self.statistic}"
+        pieces = [self.tracer]
+        if self.sample is not None:
+            pieces.append(self.sample)
+        pieces.append(self.statistic)
+        return ".".join(pieces)
 
     @property
     def tabulator_key(self) -> Path:
@@ -78,13 +87,22 @@ class ObservableDataSegment:
 
 @dataclass(frozen=True)
 class NumberDensityConstraint:
-    """One-sided number-density constraint for a tracer."""
+    """One-sided number-density constraint for a tracer or stellar sample."""
 
     tracer: str
     value: float
     mode: str = "minimum"
     error: float | None = None
     source: str = "paircounts"
+    sample: str | None = None
+
+    @property
+    def key(self) -> DensityKey:
+        return self.tracer, self.sample
+
+    @property
+    def label(self) -> str:
+        return self.tracer if self.sample is None else f"{self.tracer}.{self.sample}"
 
     def loglike(self, theory_density: float) -> float:
         mode = self.mode.lower()
@@ -97,11 +115,28 @@ class NumberDensityConstraint:
         if mode == "gaussian":
             if self.error is None or self.error <= 0.0:
                 raise ValueError(
-                    f"number_density.error must be positive for gaussian mode on tracer {self.tracer!r}."
+                    f"number_density.error must be positive for sample {self.label!r}."
                 )
             diff = theory_density - self.value
             return float(-0.5 * diff * diff / (self.error * self.error))
-        raise ValueError(f"Unknown number-density mode {self.mode!r} for tracer {self.tracer!r}.")
+        raise ValueError(f"Unknown number-density mode {self.mode!r} for sample {self.label!r}.")
+
+
+@dataclass(frozen=True)
+class StellarMassFitSpec:
+    """One tracer fixed stellar-mass split definition and fitted sample map."""
+
+    tracer: str
+    split_method: str
+    logmstar_edges: np.ndarray
+    redshift_weights: np.ndarray | None
+    samples: Mapping[str, int]
+
+    @property
+    def n_splits(self) -> int:
+        if self.split_method == "raw":
+            return int(self.logmstar_edges.size - 1)
+        return int(self.logmstar_edges.shape[1] - 1)
 
 
 @dataclass
@@ -109,7 +144,7 @@ class _TheoryEvaluation:
     """Cached theory pieces for one HOD parameter vector."""
 
     theory_vector: np.ndarray
-    number_densities: Mapping[str, float]
+    number_densities: Mapping[DensityKey, float]
 
 
 @dataclass
@@ -190,6 +225,7 @@ class HODFittingProblem:
         config: Mapping[str, Any] | None = None,
         fit_config: Mapping[str, Any] | None = None,
         tracers: Sequence[str] = (),
+        stellar_mass_specs: Mapping[str, StellarMassFitSpec] | None = None,
     ):
         self.data = data
         self.parameters = tuple(parameters)
@@ -200,6 +236,7 @@ class HODFittingProblem:
         self.config = dict(config or {})
         self.fit_config = dict(fit_config or {})
         self.tracers = tuple(str(item) for item in (tracers or _infer_tracers(self.observables)))
+        self.stellar_mass_specs = dict(stellar_mass_specs or {})
         self.fixed_params_by_tracer = _normalize_fixed_params(fixed_params, self.tracers)
         self.parameter_names = tuple(param.name for param in self.parameters)
         if len(set(self.parameter_names)) != len(self.parameter_names):
@@ -221,7 +258,10 @@ class HODFittingProblem:
             raise KeyError("Set fit.observables to a list of statistics to fit.")
 
         parameters = _parse_parameters(_required(fit_config, "parameters"))
-        observables = _parse_observable_specs(config, fit_config, tracers)
+        stellar_mass_specs = _parse_stellar_mass_specs(config, fit_config, tracers)
+        observables = _parse_observable_specs(
+            config, fit_config, tracers, stellar_mass_specs
+        )
         tabulators = _load_observable_tabulators(observables)
         data_segments = _load_observable_data(config, fit_config, observables, tabulators)
         covariance = _load_fit_covariance(config, fit_config, data_segments)
@@ -236,7 +276,9 @@ class HODFittingProblem:
             precision_scale=_precision_scale(covariance_config, values.size),
         )
 
-        density_constraints = _parse_density_constraints(fit_config, tracers)
+        density_constraints = _parse_density_constraints(
+            fit_config, tracers, stellar_mass_specs
+        )
         problem = cls(
             data=data,
             parameters=parameters,
@@ -248,6 +290,7 @@ class HODFittingProblem:
             config=config,
             fit_config=fit_config,
             tracers=tracers,
+            stellar_mass_specs=stellar_mass_specs,
         )
         if validate:
             evaluation = problem._evaluate(problem.initial_vector())
@@ -295,11 +338,21 @@ class HODFittingProblem:
     def theory_vector(self, theta: ArrayLike) -> np.ndarray:
         return self._evaluate(theta).theory_vector
 
-    def theory_number_density(self, theta: ArrayLike, tracer: str) -> float:
+    def theory_number_density(
+        self,
+        theta: ArrayLike,
+        tracer: str,
+        *,
+        sample: str | None = None,
+    ) -> float:
         densities = self._evaluate(theta).number_densities
-        if tracer not in densities:
-            raise KeyError(f"No observable is configured for tracer {tracer!r}; cannot compute number density.")
-        return float(densities[tracer])
+        key = (str(tracer), None if sample is None else str(sample))
+        if key not in densities:
+            label = key[0] if key[1] is None else f"{key[0]}.{key[1]}"
+            raise KeyError(
+                f"No observable or HMF density is configured for sample {label!r}."
+            )
+        return float(densities[key])
 
     def density_loglike(self, theta: ArrayLike) -> float:
         return self._density_loglike_from_densities(self._evaluate(theta).number_densities)
@@ -347,40 +400,85 @@ class HODFittingProblem:
     def _evaluate(self, theta: ArrayLike) -> _TheoryEvaluation:
         theta = self._theta(theta)
         segments = []
-        densities: dict[str, float] = {}
+        densities: dict[DensityKey, float] = {}
         result_cache: dict[tuple[str, Path, str], Any] = {}
         for spec in self.observables:
             cache_key = (spec.tracer, spec.paircount_path, spec.hod_model)
+            stellar_spec = self.stellar_mass_specs.get(spec.tracer)
             if cache_key not in result_cache:
                 tabulator = self._tabulator_for_spec(spec)
-                result_cache[cache_key] = tabulator.correlation(
-                    self.params_for_tracer(theta, spec.tracer),
-                    hod_model=spec.hod_model,
-                )
-            result = result_cache[cache_key]
-            densities.setdefault(spec.tracer, float(result.number_density))
+                params = self.params_for_tracer(theta, spec.tracer)
+                if stellar_spec is None:
+                    result_cache[cache_key] = tabulator.correlation(
+                        params,
+                        hod_model=spec.hod_model,
+                    )
+                else:
+                    result_cache[cache_key] = tabulator.stellar_mass_correlations(
+                        params,
+                        split_method=stellar_spec.split_method,
+                        logmstar_edges=stellar_spec.logmstar_edges,
+                        redshift_weights=stellar_spec.redshift_weights,
+                        hod_model=spec.hod_model,
+                    )
+            cached = result_cache[cache_key]
+            if stellar_spec is None:
+                result = cached
+                densities.setdefault((spec.tracer, None), float(result.number_density))
+            else:
+                if spec.split_index is None:
+                    raise RuntimeError(f"Missing split index for observable {spec.key!r}.")
+                result = cached[spec.split_index]
+                for sample, split_index in stellar_spec.samples.items():
+                    densities.setdefault(
+                        (spec.tracer, sample),
+                        float(cached[split_index].number_density),
+                    )
             segments.append(_extract_observable(result, spec))
-        for constraint in self.density_constraints:
-            if constraint.source == "hmf":
-                if constraint.tracer not in self.hmfs:
-                    raise KeyError(f"No HMF loaded for tracer {constraint.tracer!r}.")
-                densities[constraint.tracer] = hod_number_density(
-                    self.hmfs[constraint.tracer],
-                    self.params_for_tracer(theta, constraint.tracer),
-                    hod_model=self._hod_model_for_tracer(constraint.tracer),
+
+        hmf_tracers = {
+            constraint.tracer
+            for constraint in self.density_constraints
+            if constraint.source == "hmf"
+        }
+        for tracer in hmf_tracers:
+            if tracer not in self.hmfs:
+                raise KeyError(f"No HMF loaded for tracer {tracer!r}.")
+            params = self.params_for_tracer(theta, tracer)
+            stellar_spec = self.stellar_mass_specs.get(tracer)
+            if stellar_spec is None:
+                densities[(tracer, None)] = hod_number_density(
+                    self.hmfs[tracer],
+                    params,
+                    hod_model=self._hod_model_for_tracer(tracer),
                 )
+            else:
+                values = stellar_mass_hod_number_densities(
+                    self.hmfs[tracer],
+                    params,
+                    split_method=stellar_spec.split_method,
+                    logmstar_edges=stellar_spec.logmstar_edges,
+                    redshift_weights=stellar_spec.redshift_weights,
+                    hod_model=self._hod_model_for_tracer(tracer),
+                )
+                for sample, split_index in stellar_spec.samples.items():
+                    densities[(tracer, sample)] = float(values[split_index])
+
         theory = np.concatenate(segments) if segments else np.array([], dtype=np.float64)
         return _TheoryEvaluation(theory_vector=theory, number_densities=densities)
 
-    def _density_loglike_from_densities(self, densities: Mapping[str, float]) -> float:
+    def _density_loglike_from_densities(
+        self,
+        densities: Mapping[DensityKey, float],
+    ) -> float:
         total = 0.0
         for constraint in self.density_constraints:
-            if constraint.tracer not in densities:
+            if constraint.key not in densities:
                 raise KeyError(
-                    f"No observable is configured for tracer {constraint.tracer!r}; "
-                    f"cannot compute number density."
+                    f"No observable or HMF density is configured for sample "
+                    f"{constraint.label!r}."
                 )
-            term = constraint.loglike(float(densities[constraint.tracer]))
+            term = constraint.loglike(float(densities[constraint.key]))
             if not np.isfinite(term):
                 return -np.inf
             total += term
@@ -406,8 +504,33 @@ class HODFittingProblem:
         raise KeyError(f"No tabulator loaded for {spec.paircount_path}.")
 
 
-def load_fitting_problem_from_config(path2config: str | Path, *, validate: bool = True) -> HODFittingProblem:
+def load_fitting_problem_from_config(
+    path2config: str | Path,
+    *,
+    validate: bool = True,
+) -> HODFittingProblem:
     return HODFittingProblem.from_config(path2config, validate=validate)
+
+
+def load_stellar_mass_fitting_problem_from_config(
+    path2config: str | Path,
+    *,
+    validate: bool = True,
+) -> HODFittingProblem:
+    """Load a fit in which every observable selects a stellar-mass sample."""
+
+    problem = HODFittingProblem.from_config(path2config, validate=validate)
+    if not problem.stellar_mass_specs:
+        raise KeyError(
+            "Configure fit.theory.tracers.<TRACER>.stellar_mass.samples."
+        )
+    scalar = [spec.key for spec in problem.observables if spec.sample is None]
+    if scalar:
+        raise ValueError(
+            "The stellar-mass fitting runner requires sample on every observable; "
+            f"scalar observables are {scalar}."
+        )
+    return problem
 
 
 def _extract_observable(result, spec: ObservableSpec) -> np.ndarray:
@@ -443,32 +566,141 @@ def _parse_tracers(fit_config: Mapping[str, Any]) -> tuple[str, ...]:
     return out
 
 
+def _parse_stellar_mass_specs(
+    config: Mapping[str, Any],
+    fit_config: Mapping[str, Any],
+    tracers: Sequence[str],
+) -> dict[str, StellarMassFitSpec]:
+    global_config = dict((config.get("hod") or {}).get("stellar_mass") or {})
+    specs: dict[str, StellarMassFitSpec] = {}
+    for tracer in tracers:
+        local = _tracer_theory_config(fit_config, tracer).get("stellar_mass")
+        if local is None:
+            continue
+        local = dict(local)
+        samples_config = _required(local, "samples")
+        if not isinstance(samples_config, Mapping) or not samples_config:
+            raise ValueError(
+                f"fit.theory.tracers.{tracer}.stellar_mass.samples must be a non-empty mapping."
+            )
+        selection = dict(global_config)
+        selection.update({key: value for key, value in local.items() if key != "samples"})
+        method = str(_required(selection, "split_method")).lower()
+        edges, weights = normalize_stellar_mass_selection(
+            method,
+            _required(selection, "logmstar_edges"),
+            selection.get("redshift_weights"),
+        )
+        model_edges = edges[0] if method == "raw" else edges
+        model_weights = None if method == "raw" else weights
+        n_splits = int(edges.shape[1] - 1)
+        samples: dict[str, int] = {}
+        for raw_name, raw_index in samples_config.items():
+            name = str(raw_name)
+            if not name or "." in name or any(char.isspace() for char in name):
+                raise ValueError(
+                    f"Stellar-mass sample names must be non-empty and contain no dots or whitespace; got {name!r}."
+                )
+            if isinstance(raw_index, (bool, np.bool_)) or not isinstance(
+                raw_index, (int, np.integer)
+            ):
+                raise TypeError(
+                    f"Split index for stellar-mass sample {tracer}.{name} must be an integer."
+                )
+            index = int(raw_index)
+            if not 0 <= index < n_splits:
+                raise ValueError(
+                    f"Split index {index} for stellar-mass sample {tracer}.{name} "
+                    f"is outside [0, {n_splits - 1}]."
+                )
+            samples[name] = index
+        if len(set(samples.values())) != len(samples):
+            raise ValueError(
+                f"Stellar-mass samples for tracer {tracer!r} must map to unique split indices."
+            )
+        specs[tracer] = StellarMassFitSpec(
+            tracer=tracer,
+            split_method=method,
+            logmstar_edges=model_edges,
+            redshift_weights=model_weights,
+            samples=samples,
+        )
+    return specs
+
+
 def _parse_observable_specs(
     config: Mapping[str, Any],
     fit_config: Mapping[str, Any],
     tracers: Sequence[str],
+    stellar_mass_specs: Mapping[str, StellarMassFitSpec],
 ) -> tuple[ObservableSpec, ...]:
     specs = []
-    for i, item in enumerate(fit_config.get("observables", [])):
+    for item in fit_config.get("observables", []):
         obs = _normalize_observable_item(item, tracers)
         statistic = str(obs.get("statistic")).lower()
         if statistic not in _SUPPORTED_STATISTICS:
-            raise ValueError(f"Unsupported observable statistic {statistic!r}; use wp, xi0, or xi2.")
+            raise ValueError(
+                f"Unsupported observable statistic {statistic!r}; use wp, xi0, or xi2."
+            )
         tracer = str(obs.get("tracer"))
+        if tracer not in tracers:
+            raise ValueError(
+                f"Observable references tracer {tracer!r}, which is not in fit.tracers."
+            )
+        stellar_spec = stellar_mass_specs.get(tracer)
+        raw_sample = obs.get("sample")
+        if stellar_spec is None:
+            if raw_sample is not None:
+                raise ValueError(
+                    f"Observable for scalar tracer {tracer!r} must not set sample."
+                )
+            sample = None
+            split_index = None
+        else:
+            if raw_sample is None:
+                raise KeyError(
+                    f"Set sample on every observable for stellar-mass tracer {tracer!r}."
+                )
+            sample = str(raw_sample)
+            if sample not in stellar_spec.samples:
+                raise KeyError(
+                    f"Unknown stellar-mass sample {tracer}.{sample}; configured samples are "
+                    f"{tuple(stellar_spec.samples)}."
+                )
+            split_index = stellar_spec.samples[sample]
         clustering = "rppi" if statistic == "wp" else "smu"
         theory = _tracer_theory_config(fit_config, tracer)
-        paircount_path = _observable_paircount_path(config, fit_config, tracer, clustering, obs)
+        paircount_path = _observable_paircount_path(
+            config, fit_config, tracer, clustering, obs
+        )
+        key_parts = [tracer]
+        if sample is not None:
+            key_parts.append(sample)
+        key_parts.append(statistic)
         specs.append(
             ObservableSpec(
-                name=str(obs.get("name", f"{tracer}.{statistic}")),
+                name=str(obs.get("name", ".".join(key_parts))),
                 tracer=tracer,
                 statistic=statistic,
                 clustering=clustering,
                 paircount_path=paircount_path,
-                hod_model=str(obs.get("hod_model", theory.get("hod_model", config.get("hod", {}).get("model", "lrg")))),
+                hod_model=str(
+                    obs.get(
+                        "hod_model",
+                        theory.get(
+                            "hod_model",
+                            (config.get("hod") or {}).get("model", "lrg"),
+                        ),
+                    )
+                ),
+                sample=sample,
+                split_index=split_index,
                 selection=obs.get("slice", obs.get("selection")),
             )
         )
+    names = [spec.name for spec in specs]
+    if len(set(names)) != len(names):
+        raise ValueError(f"Observable names must be unique; got {names}.")
     return tuple(specs)
 
 
@@ -519,7 +751,7 @@ def _load_observable_data(
     observables: Sequence[ObservableSpec],
     tabulators: Mapping[Path, HODClusteringTabulator],
 ) -> tuple[ObservableDataSegment, ...]:
-    data_cache: dict[tuple[str, str, str], np.ndarray] = {}
+    data_cache: dict[tuple[str, str | None, str, str, str, str], np.ndarray] = {}
     segments = []
     for spec in observables:
         raw_values = _load_statistic_data(config, fit_config, spec, data_cache)
@@ -541,27 +773,53 @@ def _load_statistic_data(
     config: Mapping[str, Any],
     fit_config: Mapping[str, Any],
     spec: ObservableSpec,
-    cache: dict[tuple[str, str, str], np.ndarray],
+    cache: dict[tuple[str, str | None, str, str, str, str], np.ndarray],
 ) -> np.ndarray:
     tracer_data = _tracer_data_config(fit_config, spec.tracer)
+    sample_data = _sample_data_config(tracer_data, spec)
     if spec.statistic == "wp":
-        wp_config = dict(_required(tracer_data, "wp"))
+        wp_config = dict(_required(sample_data, "wp"))
         path = _format_config_path(_required(wp_config, "path"), config)
         column = wp_config.get("column", wp_config.get("wp_column", 1))
-        key = (spec.tracer, "wp", str(path))
+        key = (
+            spec.tracer,
+            spec.sample,
+            "wp",
+            str(path),
+            str(wp_config.get("key")),
+            repr(column),
+        )
         if key not in cache:
-            cache[key] = _load_vector(path, key=wp_config.get("key"), usecols=column)
+            cache[key] = _load_vector(
+                path,
+                key=wp_config.get("key"),
+                usecols=column,
+            )
         return cache[key]
 
-    xi02_config = dict(_required(tracer_data, "xi02"))
+    xi02_config = dict(_required(sample_data, "xi02"))
     path = _format_config_path(_required(xi02_config, "path"), config)
     column_key = "xi0_column" if spec.statistic == "xi0" else "xi2_column"
     column = xi02_config.get(column_key)
     if column is None:
-        raise KeyError(f"Set fit.data.tracers.{spec.tracer}.xi02.{column_key}.")
-    key = (spec.tracer, spec.statistic, str(path))
+        prefix = f"fit.data.tracers.{spec.tracer}"
+        if spec.sample is not None:
+            prefix += f".samples.{spec.sample}"
+        raise KeyError(f"Set {prefix}.xi02.{column_key}.")
+    key = (
+        spec.tracer,
+        spec.sample,
+        spec.statistic,
+        str(path),
+        str(xi02_config.get("key")),
+        repr(column),
+    )
     if key not in cache:
-        cache[key] = _load_vector(path, key=xi02_config.get("key"), usecols=column)
+        cache[key] = _load_vector(
+            path,
+            key=xi02_config.get("key"),
+            usecols=column,
+        )
     return cache[key]
 
 
@@ -570,6 +828,25 @@ def _tracer_data_config(fit_config: Mapping[str, Any], tracer: str) -> Mapping[s
     if tracer not in tracers:
         raise KeyError(f"Set fit.data.tracers.{tracer}.")
     return tracers[tracer]
+
+
+def _sample_data_config(
+    tracer_data: Mapping[str, Any],
+    spec: ObservableSpec,
+) -> Mapping[str, Any]:
+    if spec.sample is None:
+        return tracer_data
+    samples = tracer_data.get("samples")
+    if not isinstance(samples, Mapping) or spec.sample not in samples:
+        raise KeyError(
+            f"Set fit.data.tracers.{spec.tracer}.samples.{spec.sample}."
+        )
+    sample_data = samples[spec.sample]
+    if not isinstance(sample_data, Mapping):
+        raise TypeError(
+            f"fit.data.tracers.{spec.tracer}.samples.{spec.sample} must be a mapping."
+        )
+    return sample_data
 
 
 def _observable_theory_bin_count(
@@ -668,7 +945,10 @@ def _segment_by_label(label: str, segments: Sequence[ObservableDataSegment]) -> 
         return matches[0]
     if not matches:
         raise KeyError(f"No observable segment matches covariance label {label!r}.")
-    raise ValueError(f"Covariance label {label!r} is ambiguous; use tracer.statistic or observable name.")
+    raise ValueError(
+        f"Covariance label {label!r} is ambiguous; use the full sample key "
+        "or a unique observable name."
+    )
 
 
 def _ordered_subset(
@@ -691,30 +971,48 @@ def _block_selected_indices(segments: Sequence[ObservableDataSegment]) -> np.nda
 def _parse_density_constraints(
     fit_config: Mapping[str, Any],
     tracers: Sequence[str],
+    stellar_mass_specs: Mapping[str, StellarMassFitSpec],
 ) -> tuple[NumberDensityConstraint, ...]:
     constraints = []
+    data_tracers = fit_config.get("data", {}).get("tracers", {})
     for tracer in tracers:
-        tracer_data = fit_config.get("data", {}).get("tracers", {}).get(tracer, {})
-        config = tracer_data.get("number_density")
-        if not config:
-            continue
-        mode = str(config.get("mode", "minimum")).lower()
-        if mode == "none":
-            continue
-        source = str(config.get("source", "paircounts")).lower()
-        if source not in {"paircounts", "hmf"}:
-            raise ValueError(f"number_density.source must be 'paircounts' or 'hmf' for tracer {tracer!r}.")
-        value = float(_required(config, "value"))
-        error = config.get("error")
-        constraints.append(
-            NumberDensityConstraint(
-                tracer=tracer,
-                value=value,
-                mode=mode,
-                error=None if error is None else float(error),
-                source=source,
+        tracer_data = data_tracers.get(tracer, {})
+        stellar_spec = stellar_mass_specs.get(tracer)
+        if stellar_spec is None:
+            entries = ((None, tracer_data.get("number_density")),)
+        else:
+            samples_data = tracer_data.get("samples", {})
+            entries = tuple(
+                (
+                    sample,
+                    (samples_data.get(sample) or {}).get("number_density"),
+                )
+                for sample in stellar_spec.samples
             )
-        )
+        for sample, density_config in entries:
+            if not density_config:
+                continue
+            mode = str(density_config.get("mode", "minimum")).lower()
+            if mode == "none":
+                continue
+            source = str(density_config.get("source", "paircounts")).lower()
+            label = tracer if sample is None else f"{tracer}.{sample}"
+            if source not in {"paircounts", "hmf"}:
+                raise ValueError(
+                    f"number_density.source must be paircounts or hmf for sample {label!r}."
+                )
+            value = float(_required(density_config, "value"))
+            error = density_config.get("error")
+            constraints.append(
+                NumberDensityConstraint(
+                    tracer=tracer,
+                    sample=sample,
+                    value=value,
+                    mode=mode,
+                    error=None if error is None else float(error),
+                    source=source,
+                )
+            )
     return tuple(constraints)
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -10,6 +11,7 @@ import numpy as np
 
 from .hmf import (
     HaloMassFunction,
+    StellarMassHODDerivedQuantities,
     find_hmf_file,
     hod_central_median_host_mass,
     hod_central_median_log10_host_mass,
@@ -20,9 +22,16 @@ from .hmf import (
     hod_satellite_median_log10_host_mass,
     hod_satellite_number_density,
     read_hmf,
+    stellar_mass_hod_derived_quantities,
     validate_hmf_file_for_config,
 )
-from .linear_bias import HODLinearBiasTabulator, LinearBiasResult, infer_abacus_cosmology_index
+from .hod_models.lrg_stellar_mass import normalize_stellar_mass_selection
+from .linear_bias import (
+    HODLinearBiasTabulator,
+    LinearBiasResult,
+    StellarMassLinearBiasResult,
+    infer_abacus_cosmology_index,
+)
 from .paircounts import resolve_paircount_path_from_config
 
 
@@ -40,6 +49,30 @@ _HMF_QUANTITIES = set(DEFAULT_QUANTITIES)
 _LINEAR_BIAS_QUANTITIES = {"linear_bias"}
 
 
+@dataclass(frozen=True)
+class StellarMassDerivedResult:
+    """Selected derived quantities for every stellar-mass split."""
+
+    values: Mapping[str, np.ndarray]
+    split_method: str
+    logmstar_edges: np.ndarray
+    redshift_weights: np.ndarray
+
+    @property
+    def n_splits(self) -> int:
+        if self.split_method == "raw":
+            return int(self.logmstar_edges.size - 1)
+        return int(self.logmstar_edges.shape[1] - 1)
+
+    def __len__(self) -> int:
+        return self.n_splits
+
+    def __getitem__(self, index: int) -> dict[str, float]:
+        if not 0 <= int(index) < self.n_splits:
+            raise IndexError(index)
+        return {name: float(value[index]) for name, value in self.values.items()}
+
+
 class HODDerivedTabulator:
     """Reusable post-processing object for scalar HOD-derived quantities."""
 
@@ -50,11 +83,15 @@ class HODDerivedTabulator:
         linear_bias_tabulator: HODLinearBiasTabulator | None = None,
         hod_model: str = "lrg",
         quantities: Sequence[str] = DEFAULT_QUANTITIES,
+        stellar_mass: Mapping[str, Any] | None = None,
     ):
         self.hmf = hmf
         self.linear_bias_tabulator = linear_bias_tabulator
         self.hod_model = str(hod_model)
         self.quantities = tuple(_canonical_quantity_name(item) for item in quantities)
+        self.stellar_mass = (
+            None if not stellar_mass else _normalize_stellar_mass_config(stellar_mass)
+        )
 
     @classmethod
     def from_config(
@@ -81,6 +118,15 @@ class HODDerivedTabulator:
                 "hod_model",
                 _fit_tracer_theory_config(config, tracer).get("hod_model", config.get("hod", {}).get("model", "lrg")),
             )
+        )
+        theory_config = _fit_tracer_theory_config(config, tracer)
+        stellar_mass = _merged_mapping(
+            config.get("hod", {}).get("stellar_mass"),
+            theory_config.get("stellar_mass"),
+        )
+        stellar_mass = _merged_mapping(
+            stellar_mass,
+            tracer_config.get("stellar_mass"),
         )
         linear_config = _merged_mapping(derived_config.get("linear_bias"), tracer_config.get("linear_bias"))
         if not bool(linear_config.get("enabled", True)):
@@ -114,6 +160,7 @@ class HODDerivedTabulator:
             linear_bias_tabulator=linear_bias_tabulator,
             hod_model=hod_model,
             quantities=quantities,
+            stellar_mass=stellar_mass,
         )
 
     def number_density(self, hod_params: Mapping[str, Any], *, hod_model: str | None = None) -> float:
@@ -175,10 +222,158 @@ class HODDerivedTabulator:
                 raise ValueError(f"Unknown derived quantity {quantity!r}.")
         return out
 
+    @property
+    def has_stellar_mass(self) -> bool:
+        return self.stellar_mass is not None
+
+    def evaluate_stellar_mass(
+        self,
+        hod_params: Mapping[str, Any],
+        *,
+        split_method: str | None = None,
+        logmstar_edges: Any = None,
+        redshift_weights: Any = None,
+        hod_model: str | None = None,
+        quantities: Sequence[str] | None = None,
+    ) -> StellarMassDerivedResult:
+        """Evaluate selected derived quantities for every stellar-mass split."""
+
+        configured = self.stellar_mass or {}
+        method = split_method if split_method is not None else configured.get("split_method")
+        edges = logmstar_edges if logmstar_edges is not None else configured.get("logmstar_edges")
+        weights = (
+            redshift_weights
+            if redshift_weights is not None
+            else configured.get("redshift_weights")
+        )
+        if method is None or edges is None:
+            raise KeyError(
+                "Set split_method and logmstar_edges directly or configure "
+                "derived.tracers.<TRACER>.stellar_mass."
+            )
+        normalized_edges, normalized_weights = normalize_stellar_mass_selection(
+            str(method),
+            edges,
+            weights,
+        )
+        normalized_method = str(method).lower()
+        model_edges = (
+            normalized_edges[0] if normalized_method == "raw" else normalized_edges
+        )
+        model_weights = None if normalized_method == "raw" else normalized_weights
+        model = hod_model or self.hod_model
+        selected = tuple(
+            _canonical_quantity_name(item) for item in (quantities or self.quantities)
+        )
+
+        hmf_result: StellarMassHODDerivedQuantities | None = None
+        if any(item in _HMF_QUANTITIES for item in selected):
+            hmf_result = stellar_mass_hod_derived_quantities(
+                self._require_hmf(),
+                hod_params,
+                split_method=normalized_method,
+                logmstar_edges=model_edges,
+                redshift_weights=model_weights,
+                hod_model=model,
+            )
+        linear_result: StellarMassLinearBiasResult | None = None
+        if any(item in _LINEAR_BIAS_QUANTITIES for item in selected):
+            if self.linear_bias_tabulator is None:
+                raise KeyError(
+                    "Linear bias was requested but no linear-bias tabulator is configured."
+                )
+            linear_result = self.linear_bias_tabulator.evaluate_stellar_mass(
+                hod_params,
+                split_method=normalized_method,
+                logmstar_edges=model_edges,
+                redshift_weights=model_weights,
+                hod_model=model,
+            )
+
+        values: dict[str, np.ndarray] = {}
+        for quantity in selected:
+            if quantity == "n_cen":
+                values[quantity] = _require_stellar_hmf_result(hmf_result).n_cen
+            elif quantity == "n_sat":
+                values[quantity] = _require_stellar_hmf_result(hmf_result).n_sat
+            elif quantity == "number_density":
+                values[quantity] = _require_stellar_hmf_result(hmf_result).n_gal
+            elif quantity == "satellite_fraction":
+                values[quantity] = _require_stellar_hmf_result(hmf_result).f_sat
+            elif quantity == "log10_mh_cen_med":
+                values[quantity] = _require_stellar_hmf_result(hmf_result).log10_mh_cen_med
+            elif quantity == "log10_mh_sat_med":
+                values[quantity] = _require_stellar_hmf_result(hmf_result).log10_mh_sat_med
+            elif quantity == "mh_cen_med":
+                values[quantity] = _require_stellar_hmf_result(hmf_result).mh_cen_med
+            elif quantity == "mh_sat_med":
+                values[quantity] = _require_stellar_hmf_result(hmf_result).mh_sat_med
+            elif quantity == "linear_bias":
+                if linear_result is None:
+                    raise RuntimeError("Missing stellar-mass linear-bias result.")
+                values[quantity] = linear_result.bias
+            else:
+                raise ValueError(f"Unknown derived quantity {quantity!r}.")
+
+        n_splits = normalized_edges.shape[1] - 1
+        for name, value in values.items():
+            value = np.asarray(value, dtype=np.float64)
+            if value.shape != (n_splits,):
+                raise ValueError(
+                    f"Derived quantity {name!r} has shape {value.shape}; "
+                    f"expected ({n_splits},)."
+                )
+            values[name] = value
+        output_edges = model_edges
+        return StellarMassDerivedResult(
+            values=values,
+            split_method=normalized_method,
+            logmstar_edges=output_edges,
+            redshift_weights=normalized_weights,
+        )
+
     def _require_hmf(self) -> HaloMassFunction:
         if self.hmf is None:
             raise KeyError("This derived quantity requires an HMF, but no HMF is configured.")
         return self.hmf
+
+
+def _require_stellar_hmf_result(
+    result: StellarMassHODDerivedQuantities | None,
+) -> StellarMassHODDerivedQuantities:
+    if result is None:
+        raise RuntimeError("Missing stellar-mass HMF-derived result.")
+    return result
+
+
+def _normalize_stellar_mass_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    if "split_method" not in config:
+        raise KeyError("stellar_mass.split_method is required.")
+    if "logmstar_edges" not in config:
+        raise KeyError("stellar_mass.logmstar_edges is required.")
+    method = str(config["split_method"]).lower()
+    edges, weights = normalize_stellar_mass_selection(
+        method,
+        config["logmstar_edges"],
+        config.get("redshift_weights"),
+    )
+    return {
+        "split_method": method,
+        "logmstar_edges": edges[0] if method == "raw" else edges,
+        "redshift_weights": None if method == "raw" else weights,
+    }
+
+
+def _stellar_mass_result_payload(result: StellarMassDerivedResult) -> dict[str, Any]:
+    return {
+        "split_method": result.split_method,
+        "logmstar_edges": result.logmstar_edges,
+        "redshift_weights": result.redshift_weights,
+        "splits": [
+            {"index": index, "derived": result[index]}
+            for index in range(result.n_splits)
+        ],
+    }
 
 
 def write_optimization_derived(problem: Any, theta: Sequence[float], output_dir: str | Path, prefix: str) -> dict[str, Any]:
@@ -191,10 +386,18 @@ def write_optimization_derived(problem: Any, theta: Sequence[float], output_dir:
     for tracer in problem.tracers:
         tabulator = HODDerivedTabulator.from_config(problem.config, tracer=tracer)
         params = problem.params_for_tracer(theta, tracer)
-        payload[tracer] = {
-            "hod_params": params,
-            "derived": tabulator.evaluate(params),
-        }
+        if tabulator.has_stellar_mass:
+            payload[tracer] = {
+                "hod_params": params,
+                "stellar_mass": _stellar_mass_result_payload(
+                    tabulator.evaluate_stellar_mass(params)
+                ),
+            }
+        else:
+            payload[tracer] = {
+                "hod_params": params,
+                "derived": tabulator.evaluate(params),
+            }
     path = output_dir / f"{prefix}_optimum_derived.json"
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(_json_ready(payload), handle, indent=2)
@@ -233,10 +436,17 @@ def write_mcmc_derived(
         names: list[str] = []
         for tracer, tabulator in tabulators.items():
             params = problem.params_for_tracer(theta, tracer)
-            values = tabulator.evaluate(params)
-            for key, value in values.items():
-                names.append(f"{tracer}.{key}")
-                row.append(float(value))
+            if tabulator.has_stellar_mass:
+                split_result = tabulator.evaluate_stellar_mass(params)
+                for split_index in range(split_result.n_splits):
+                    for key, value in split_result.values.items():
+                        names.append(f"{tracer}.sm{split_index}.{key}")
+                        row.append(float(value[split_index]))
+            else:
+                values = tabulator.evaluate(params)
+                for key, value in values.items():
+                    names.append(f"{tracer}.{key}")
+                    row.append(float(value))
         if derived_names is None:
             derived_names = names
         elif derived_names != names:
@@ -282,7 +492,7 @@ def _resolve_tracer(config: Mapping[str, Any], tracer: str | None) -> str:
     derived_tracers = config.get("derived", {}).get("tracers", {})
     if derived_tracers:
         return str(next(iter(derived_tracers)))
-    fit_tracers = config.get("fit", {}).get("tracers")
+    fit_tracers = (config.get("fit") or {}).get("tracers")
     if fit_tracers:
         return str(fit_tracers[0] if not isinstance(fit_tracers, str) else fit_tracers)
     return "LRG"
@@ -293,7 +503,7 @@ def _derived_tracer_config(config: Mapping[str, Any], tracer: str) -> dict[str, 
 
 
 def _fit_tracer_theory_config(config: Mapping[str, Any], tracer: str) -> Mapping[str, Any]:
-    return config.get("fit", {}).get("theory", {}).get("tracers", {}).get(tracer, {})
+    return (config.get("fit") or {}).get("theory", {}).get("tracers", {}).get(tracer, {})
 
 
 def _merged_mapping(base: Mapping[str, Any] | None, override: Mapping[str, Any] | None) -> dict[str, Any]:
