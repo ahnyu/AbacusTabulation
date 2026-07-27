@@ -27,9 +27,10 @@ hod:
 
   # raw: one edge array; relative: one edge-array row per redshift cell.
   # Omitted relative redshift_weights default to equal weights.
+  # A final .inf includes every galaxy above the last finite boundary.
   stellar_mass:
     split_method: raw
-    logmstar_edges: [10.4, 11.05, 11.30, 11.55, 12.2]
+    logmstar_edges: [10.4, 11.05, 11.30, 11.55, .inf]
 
   params:
     logMcut: 13.0
@@ -60,7 +61,6 @@ derived:
 
   tracers:
     LRG:
-      hod_model: lrg_stellar_mass
       hmf:
         path: null
 
@@ -103,7 +103,6 @@ fit:
   theory:
     tracers:
       LRG:
-        hod_model: lrg_stellar_mass
         stellar_mass:
           samples:
             sm0: 0

@@ -138,6 +138,16 @@ def _validate_real_space_smu_paircounts(tabulator: HODClusteringTabulator) -> No
     paircounts = tabulator.paircounts
     if paircounts.clustering != "smu":
         raise ValueError("Linear-bias postprocessing requires smu paircounts.")
+    mu_edges = np.asarray(paircounts.bins.get("mu_edges"), dtype=np.float64)
+    if (
+        mu_edges.ndim != 1
+        or mu_edges.size < 2
+        or not np.isclose(mu_edges[0], 0.0, rtol=0.0, atol=1.0e-12)
+        or not np.isclose(mu_edges[-1], 1.0, rtol=0.0, atol=1.0e-12)
+    ):
+        raise ValueError(
+            "Linear-bias postprocessing requires mu bins spanning [0, 1]."
+        )
     position_dataset = str(paircounts.attrs.get("position_dataset", "pos"))
     if position_dataset != "pos":
         raise ValueError("Linear-bias postprocessing requires real-space position_dataset='pos'.")

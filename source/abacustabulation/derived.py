@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from multiprocessing import get_context
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from .config import resolve_hod_model_from_config
 from .hmf import (
     HaloMassFunction,
     StellarMassHODDerivedQuantities,
@@ -16,6 +18,7 @@ from .hmf import (
     hod_central_median_host_mass,
     hod_central_median_log10_host_mass,
     hod_central_number_density,
+    hod_derived_quantities,
     hod_number_density,
     hod_satellite_fraction,
     hod_satellite_median_host_mass,
@@ -25,7 +28,10 @@ from .hmf import (
     stellar_mass_hod_derived_quantities,
     validate_hmf_file_for_config,
 )
-from .hod_models.lrg_stellar_mass import normalize_stellar_mass_selection
+from .stellar_mass import (
+    StellarMassSelection,
+    normalize_stellar_mass_selection,
+)
 from .linear_bias import (
     HODLinearBiasTabulator,
     LinearBiasResult,
@@ -47,6 +53,8 @@ DEFAULT_QUANTITIES = (
 )
 _HMF_QUANTITIES = set(DEFAULT_QUANTITIES)
 _LINEAR_BIAS_QUANTITIES = {"linear_bias"}
+_DERIVED_WORKER_PROBLEM = None
+_DERIVED_WORKER_TABULATORS = None
 
 
 @dataclass(frozen=True)
@@ -83,15 +91,20 @@ class HODDerivedTabulator:
         linear_bias_tabulator: HODLinearBiasTabulator | None = None,
         hod_model: str = "lrg",
         quantities: Sequence[str] = DEFAULT_QUANTITIES,
-        stellar_mass: Mapping[str, Any] | None = None,
+        stellar_mass: Mapping[str, Any] | StellarMassSelection | None = None,
     ):
         self.hmf = hmf
         self.linear_bias_tabulator = linear_bias_tabulator
         self.hod_model = str(hod_model)
         self.quantities = tuple(_canonical_quantity_name(item) for item in quantities)
-        self.stellar_mass = (
-            None if not stellar_mass else _normalize_stellar_mass_config(stellar_mass)
-        )
+        if isinstance(stellar_mass, StellarMassSelection):
+            self.stellar_mass = stellar_mass
+        else:
+            self.stellar_mass = (
+                None
+                if not stellar_mass
+                else _normalize_stellar_mass_config(stellar_mass)
+            )
 
     @classmethod
     def from_config(
@@ -113,12 +126,7 @@ class HODDerivedTabulator:
             _canonical_quantity_name(item)
             for item in tracer_config.get("quantities", derived_config.get("quantities", DEFAULT_QUANTITIES))
         )
-        hod_model = str(
-            tracer_config.get(
-                "hod_model",
-                _fit_tracer_theory_config(config, tracer).get("hod_model", config.get("hod", {}).get("model", "lrg")),
-            )
-        )
+        hod_model = resolve_hod_model_from_config(config, tracer=tracer)
         theory_config = _fit_tracer_theory_config(config, tracer)
         stellar_mass = _merged_mapping(
             config.get("hod", {}).get("stellar_mass"),
@@ -197,25 +205,33 @@ class HODDerivedTabulator:
         quantities: Sequence[str] | None = None,
     ) -> dict[str, float]:
         model = hod_model or self.hod_model
-        selected = tuple(_canonical_quantity_name(item) for item in (quantities or self.quantities))
+        requested = self.quantities if quantities is None else quantities
+        selected = tuple(_canonical_quantity_name(item) for item in requested)
+        hmf_result = None
+        if any(quantity in _HMF_QUANTITIES for quantity in selected):
+            hmf_result = hod_derived_quantities(
+                self._require_hmf(),
+                hod_params,
+                hod_model=model,
+            )
         out: dict[str, float] = {}
         for quantity in selected:
             if quantity == "n_cen":
-                out[quantity] = self.central_number_density(hod_params, hod_model=model)
+                out[quantity] = hmf_result.n_cen
             elif quantity == "n_sat":
-                out[quantity] = self.satellite_number_density(hod_params, hod_model=model)
+                out[quantity] = hmf_result.n_sat
             elif quantity == "number_density":
-                out[quantity] = self.number_density(hod_params, hod_model=model)
+                out[quantity] = hmf_result.n_gal
             elif quantity == "satellite_fraction":
-                out[quantity] = self.satellite_fraction(hod_params, hod_model=model)
+                out[quantity] = hmf_result.f_sat
             elif quantity == "log10_mh_cen_med":
-                out[quantity] = hod_central_median_log10_host_mass(self._require_hmf(), hod_params, hod_model=model)
+                out[quantity] = hmf_result.log10_mh_cen_med
             elif quantity == "log10_mh_sat_med":
-                out[quantity] = hod_satellite_median_log10_host_mass(self._require_hmf(), hod_params, hod_model=model)
+                out[quantity] = hmf_result.log10_mh_sat_med
             elif quantity == "mh_cen_med":
-                out[quantity] = self.median_central_host_mass(hod_params, hod_model=model)
+                out[quantity] = hmf_result.mh_cen_med
             elif quantity == "mh_sat_med":
-                out[quantity] = self.median_satellite_host_mass(hod_params, hod_model=model)
+                out[quantity] = hmf_result.mh_sat_med
             elif quantity == "linear_bias":
                 out[quantity] = self.linear_bias(hod_params, hod_model=model)
             else:
@@ -238,13 +254,21 @@ class HODDerivedTabulator:
     ) -> StellarMassDerivedResult:
         """Evaluate selected derived quantities for every stellar-mass split."""
 
-        configured = self.stellar_mass or {}
-        method = split_method if split_method is not None else configured.get("split_method")
-        edges = logmstar_edges if logmstar_edges is not None else configured.get("logmstar_edges")
+        configured = self.stellar_mass
+        method = (
+            split_method
+            if split_method is not None
+            else None if configured is None else configured.split_method
+        )
+        edges = (
+            logmstar_edges
+            if logmstar_edges is not None
+            else None if configured is None else configured.logmstar_edges
+        )
         weights = (
             redshift_weights
             if redshift_weights is not None
-            else configured.get("redshift_weights")
+            else None if configured is None else configured.redshift_weights
         )
         if method is None or edges is None:
             raise KeyError(
@@ -262,9 +286,8 @@ class HODDerivedTabulator:
         )
         model_weights = None if normalized_method == "raw" else normalized_weights
         model = hod_model or self.hod_model
-        selected = tuple(
-            _canonical_quantity_name(item) for item in (quantities or self.quantities)
-        )
+        requested = self.quantities if quantities is None else quantities
+        selected = tuple(_canonical_quantity_name(item) for item in requested)
 
         hmf_result: StellarMassHODDerivedQuantities | None = None
         if any(item in _HMF_QUANTITIES for item in selected):
@@ -346,34 +369,109 @@ def _require_stellar_hmf_result(
     return result
 
 
-def _normalize_stellar_mass_config(config: Mapping[str, Any]) -> dict[str, Any]:
+def _normalize_stellar_mass_config(
+    config: Mapping[str, Any],
+) -> StellarMassSelection:
     if "split_method" not in config:
         raise KeyError("stellar_mass.split_method is required.")
     if "logmstar_edges" not in config:
         raise KeyError("stellar_mass.logmstar_edges is required.")
-    method = str(config["split_method"]).lower()
-    edges, weights = normalize_stellar_mass_selection(
-        method,
+    return StellarMassSelection.from_values(
+        config["split_method"],
         config["logmstar_edges"],
         config.get("redshift_weights"),
     )
-    return {
-        "split_method": method,
-        "logmstar_edges": edges[0] if method == "raw" else edges,
-        "redshift_weights": None if method == "raw" else weights,
-    }
 
 
-def _stellar_mass_result_payload(result: StellarMassDerivedResult) -> dict[str, Any]:
+def _stellar_mass_result_payload(
+    result: StellarMassDerivedResult,
+    *,
+    split_names: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    if split_names is None:
+        split_names = tuple(f"sm{index}" for index in range(result.n_splits))
     return {
         "split_method": result.split_method,
         "logmstar_edges": result.logmstar_edges,
         "redshift_weights": result.redshift_weights,
         "splits": [
-            {"index": index, "derived": result[index]}
+            {
+                "index": index,
+                "name": split_names[index],
+                "derived": result[index],
+            }
             for index in range(result.n_splits)
         ],
     }
+
+
+def _stellar_split_names(
+    problem: Any,
+    tracer: str,
+    n_splits: int,
+) -> tuple[str, ...]:
+    spec = getattr(problem, "stellar_mass_specs", {}).get(tracer)
+    configured = {} if spec is None else dict(spec.samples)
+    names_by_index = {int(index): str(name) for name, index in configured.items()}
+    used = set(names_by_index.values())
+    names = []
+    for index in range(n_splits):
+        if index in names_by_index:
+            names.append(names_by_index[index])
+            continue
+        fallback = f"sm{index}"
+        if fallback in used:
+            fallback = f"split{index}"
+        used.add(fallback)
+        names.append(fallback)
+    return tuple(names)
+
+
+def _evaluate_derived_row(
+    problem: Any,
+    tabulators: Mapping[str, HODDerivedTabulator],
+    theta: Sequence[float],
+) -> tuple[list[float], list[str]]:
+    row: list[float] = []
+    names: list[str] = []
+    for tracer, tabulator in tabulators.items():
+        params = problem.params_for_tracer(theta, tracer)
+        if tabulator.has_stellar_mass:
+            split_result = tabulator.evaluate_stellar_mass(params)
+            split_names = _stellar_split_names(
+                problem,
+                tracer,
+                split_result.n_splits,
+            )
+            for split_index, split_name in enumerate(split_names):
+                for key, value in split_result.values.items():
+                    names.append(f"{tracer}.{split_name}.{key}")
+                    row.append(float(value[split_index]))
+        else:
+            values = tabulator.evaluate(params)
+            for key, value in values.items():
+                names.append(f"{tracer}.{key}")
+                row.append(float(value))
+    return row, names
+
+
+def _initialize_derived_worker(
+    problem: Any,
+    tabulators: Mapping[str, HODDerivedTabulator],
+) -> None:
+    global _DERIVED_WORKER_PROBLEM, _DERIVED_WORKER_TABULATORS
+    _DERIVED_WORKER_PROBLEM = problem
+    _DERIVED_WORKER_TABULATORS = tabulators
+
+
+def _evaluate_derived_worker(theta: Sequence[float]) -> list[float]:
+    if _DERIVED_WORKER_PROBLEM is None or _DERIVED_WORKER_TABULATORS is None:
+        raise RuntimeError("Derived worker was not initialized.")
+    return _evaluate_derived_row(
+        _DERIVED_WORKER_PROBLEM,
+        _DERIVED_WORKER_TABULATORS,
+        theta,
+    )[0]
 
 
 def write_optimization_derived(problem: Any, theta: Sequence[float], output_dir: str | Path, prefix: str) -> dict[str, Any]:
@@ -387,10 +485,16 @@ def write_optimization_derived(problem: Any, theta: Sequence[float], output_dir:
         tabulator = HODDerivedTabulator.from_config(problem.config, tracer=tracer)
         params = problem.params_for_tracer(theta, tracer)
         if tabulator.has_stellar_mass:
+            result = tabulator.evaluate_stellar_mass(params)
             payload[tracer] = {
                 "hod_params": params,
                 "stellar_mass": _stellar_mass_result_payload(
-                    tabulator.evaluate_stellar_mass(params)
+                    result,
+                    split_names=_stellar_split_names(
+                        problem,
+                        tracer,
+                        result.n_splits,
+                    ),
                 ),
             }
         else:
@@ -412,6 +516,9 @@ def write_mcmc_derived(
     logprior: np.ndarray,
     output_dir: str | Path,
     prefix: str,
+    *,
+    n_processes: int | None = None,
+    multiprocessing_start_method: str | None = None,
 ) -> dict[str, Any]:
     """Compute and write derived quantities aligned with saved posterior samples."""
 
@@ -426,41 +533,62 @@ def write_mcmc_derived(
     n_samples = samples.shape[0]
     if not (weights.size == loglike.size == logprior.size == n_samples):
         raise ValueError("MCMC samples, weights, loglike, and logprior lengths must match.")
+    if n_samples == 0:
+        raise ValueError("Cannot postprocess an empty posterior sample set.")
     sample_indices = np.arange(n_samples)
 
-    tabulators = {tracer: HODDerivedTabulator.from_config(problem.config, tracer=tracer) for tracer in problem.tracers}
-    derived_rows: list[list[float]] = []
-    derived_names: list[str] | None = None
-    for theta in samples:
-        row: list[float] = []
-        names: list[str] = []
-        for tracer, tabulator in tabulators.items():
-            params = problem.params_for_tracer(theta, tracer)
-            if tabulator.has_stellar_mass:
-                split_result = tabulator.evaluate_stellar_mass(params)
-                for split_index in range(split_result.n_splits):
-                    for key, value in split_result.values.items():
-                        names.append(f"{tracer}.sm{split_index}.{key}")
-                        row.append(float(value[split_index]))
-            else:
-                values = tabulator.evaluate(params)
-                for key, value in values.items():
-                    names.append(f"{tracer}.{key}")
-                    row.append(float(value))
-        if derived_names is None:
-            derived_names = names
-        elif derived_names != names:
-            raise RuntimeError("Derived quantity columns changed between samples.")
-        derived_rows.append(row)
+    tabulators = {
+        tracer: HODDerivedTabulator.from_config(problem.config, tracer=tracer)
+        for tracer in problem.tracers
+    }
+    first_row, derived_names = _evaluate_derived_row(
+        problem,
+        tabulators,
+        samples[0],
+    )
+    derived_rows = [first_row]
+    post_config = problem.fit_config.get("postprocess", {})
+    worker_count = int(
+        n_processes
+        if n_processes is not None
+        else post_config.get("n_processes", 1)
+    )
+    if worker_count < 1:
+        raise ValueError("fit.postprocess.n_processes must be at least 1.")
+    if n_samples > 1:
+        if worker_count == 1:
+            derived_rows.extend(
+                _evaluate_derived_row(problem, tabulators, theta)[0]
+                for theta in samples[1:]
+            )
+        else:
+            start_method = str(
+                multiprocessing_start_method
+                or post_config.get("multiprocessing_start_method", "fork")
+            )
+            context = get_context(start_method)
+            chunk_size = max(1, (n_samples - 1) // (4 * worker_count))
+            with context.Pool(
+                worker_count,
+                initializer=_initialize_derived_worker,
+                initargs=(problem, tabulators),
+            ) as pool:
+                derived_rows.extend(
+                    pool.imap(
+                        _evaluate_derived_worker,
+                        samples[1:],
+                        chunksize=chunk_size,
+                    )
+                )
 
     derived = np.asarray(derived_rows, dtype=np.float64)
     base = np.column_stack([sample_indices, samples, weights, loglike, logprior])
     table = np.column_stack([base, derived]) if derived.size else base
-    header = " ".join(("sample_index", *problem.parameter_names, "weight", "loglike", "logprior", *(derived_names or ())))
+    header = " ".join(("sample_index", *problem.parameter_names, "weight", "loglike", "logprior", *derived_names))
     path = output_dir / f"{prefix}_chains_derived.txt"
     np.savetxt(path, table, header=header)
 
-    summary = _weighted_summary(derived, weights, derived_names or [])
+    summary = _weighted_summary(derived, weights, derived_names)
     summary_path = output_dir / f"{prefix}_derived_summary.json"
     with open(summary_path, "w", encoding="utf-8") as handle:
         json.dump(_json_ready(summary), handle, indent=2)
@@ -552,7 +680,12 @@ def _format_sim_output_dir(value: str | Path, config: Mapping[str, Any]) -> Path
 
 
 def _resolve_hmf_path(config: Mapping[str, Any], tracer: str, tracer_config: Mapping[str, Any]) -> Path:
-    hmf_config = _merged_mapping(config.get("hmf"), tracer_config.get("hmf"))
+    tracer_hmf = {
+        key: value
+        for key, value in dict(tracer_config.get("hmf") or {}).items()
+        if value is not None
+    }
+    hmf_config = _merged_mapping(config.get("hmf"), tracer_hmf)
     if hmf_config.get("path") is not None:
         return validate_hmf_file_for_config(
             _format_exact_path(hmf_config["path"], config),

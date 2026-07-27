@@ -1515,7 +1515,20 @@ def _compute_config_job(
         _first_not_none(position_dataset, job_params.get("position_dataset"), pair_params.get("position_dataset"), "pos")
     )
     effective_clustering = _first_not_none(clustering, job_params.get("clustering"), pair_params.get("clustering"), "rppi")
-    _validate_paircount_job(job_name, effective_position_dataset, effective_clustering)
+    effective_mu_max = float(
+        _first_not_none(
+            mu_max,
+            smu_params.get("mu_max"),
+            pair_params.get("mu_max"),
+            1.0,
+        )
+    )
+    _validate_paircount_job(
+        job_name,
+        effective_position_dataset,
+        effective_clustering,
+        effective_mu_max,
+    )
 
     effective_file_tag = _first_not_none(file_tag, job_params.get("file_tag"), pair_params.get("file_tag"))
     effective_seed = _first_not_none(seed, job_params.get("seed"), pair_params.get("seed"), prepare_params.get("seed"))
@@ -1575,7 +1588,7 @@ def _compute_config_job(
         s_min=float(_first_not_none(s_min, smu_params.get("s_min"), pair_params.get("s_min"), -1.5)),
         s_max=float(_first_not_none(s_max, smu_params.get("s_max"), pair_params.get("s_max"), 1.5)),
         s_binning=normalize_radial_binning(_first_not_none(s_binning, smu_params.get("s_binning"), pair_params.get("s_binning"), "log10")),
-        mu_max=float(_first_not_none(mu_max, smu_params.get("mu_max"), pair_params.get("mu_max"), 1.0)),
+        mu_max=effective_mu_max,
         nmu_bins=int(_first_not_none(nmu_bins, smu_params.get("nmu_bins"), pair_params.get("nmu_bins"), 100)),
     )
 
@@ -1584,6 +1597,7 @@ def _validate_paircount_job(
     job_name: str | None,
     position_dataset: str,
     clustering: object | None,
+    mu_max: float,
 ) -> None:
     if str(job_name or "") != "linear_bias":
         return
@@ -1592,6 +1606,8 @@ def _validate_paircount_job(
         raise ValueError("paircounts.jobs.linear_bias must set clustering: [smu].")
     if str(position_dataset) != "pos":
         raise ValueError("paircounts.jobs.linear_bias must use real-space position_dataset: pos.")
+    if not np.isclose(float(mu_max), 1.0, rtol=0.0, atol=1.0e-12):
+        raise ValueError("paircounts.jobs.linear_bias must set smu.mu_max: 1.0.")
 
 
 def _cache_piece(value: Any) -> str:
@@ -1654,6 +1670,8 @@ def _load_cached_binned_catalog(
     if cache is not None and key in cache:
         print("reusing prepared catalog mass bins", flush=True)
         return cache[key]
+    if cache:
+        cache.clear()
 
     print("loading prepared catalog into mass bins", flush=True)
     catalog, mass_tab = load_prepared_binned_catalog(

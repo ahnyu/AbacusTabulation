@@ -44,6 +44,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override fit.mcmc.pocomc.multiprocessing_start_method.",
     )
     parser.add_argument(
+        "--threads-per-process",
+        type=int,
+        help="Native math threads per process; defaults to the config value or 1.",
+    )
+    parser.add_argument(
         "--no-validate",
         action="store_true",
         help="Skip initial theory/data length validation.",
@@ -53,6 +58,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    from abacustabulation.runtime import configure_pocomc_native_threads
+
+    native_threads = configure_pocomc_native_threads(
+        args.path2config,
+        override=args.threads_per_process,
+    )
+    print(f"limiting native math libraries to {native_threads} thread(s) per process")
 
     from abacustabulation.fitting import (
         load_stellar_mass_fitting_problem_from_config,

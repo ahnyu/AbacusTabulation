@@ -1,0 +1,221 @@
+# Four-bin LRG stellar-mass fit to the z=0.4-0.6 wp measurements in data/LRG.
+inherits: abacustabulation_base.yaml
+
+sim_params:
+  sim_name: AbacusSummit_base_c000_ph000
+  z_mock: 0.500
+
+paircounts:
+  mass:
+    nmass_bins: 40
+    n_subbins: 10
+  jobs:
+    clustering:
+      position_dataset: pos_rsd
+    linear_bias:
+      smu:
+        s_binning: linear
+        ns_bins: 30
+        s_min: 20.0
+        s_max: 80.0
+        mu_max: 1.0
+        nmu_bins: 100
+
+hmf:
+  n_bins: 400
+  path: AbacusTabulation_data/hmf/AbacusSummit_base_c000_ph000/z0.500/hmf_abacustab-profiles-conc-r98-L2com-over-r25-L2com_seed600_n400.h5
+
+hod:
+  model: lrg_stellar_mass
+  stellar_mass:
+    split_method: raw
+    logmstar_edges: [10.8, 11.08, 11.167, 11.278, .inf]
+  params:
+    logMcut: 13.0
+    sigma: 0.4
+    logM1: 14.0
+    kappa: 1.0
+    alpha: 1.0
+    a_c: 1.0
+    logMstar_cen_bend: 11.2
+    logMh_cen_bend: 13.5
+    beta_cen_low: 0.5
+    beta_cen_high: 0.2
+    sigma_logMstar_cen: 0.18
+    width_cen_bend: 1.0
+    alpha_star_sat: -1.2
+    delta_cs_pivot: 0.4
+    delta_cs_gradient: 0.05
+    logMh_delta_pivot: 14.0
+
+derived:
+  linear_bias:
+    enabled: true
+    paircounts_path: AbacusTabulation_data/paircounts/AbacusSummit_base_c000_ph000/z0.500/linear-bias/paircounts_linear-bias_smu_pos_abacustab-profiles-conc-r98-L2com-over-r25-L2com_m40.h5
+    fit_s_min: 10.0
+    fit_s_max: 40.0
+    cosmology_index: 0
+    z: 0.5
+fit:
+  tracers: [LRG]
+  observables:
+    - {tracer: LRG, sample: sm0, statistic: wp, slice: [0, 18]}
+    - {tracer: LRG, sample: sm1, statistic: wp, slice: [0, 18]}
+    - {tracer: LRG, sample: sm2, statistic: wp, slice: [0, 18]}
+    - {tracer: LRG, sample: sm3, statistic: wp, slice: [0, 18]}
+
+  data:
+    tracers:
+      LRG:
+        wp: null
+        xi02: null
+        number_density: null
+        samples:
+          sm0:
+            wp:
+              path: data/LRG/wp_LRG_z0.4-0.6_FSF_LOGMSTAR7.387-11.08_combined-FSF_GCcomb.txt
+              column: 1
+            number_density:
+              {value: 1.27e-4, error: 1.27e-5, mode: gaussian_two_sided, source: hmf}
+          sm1:
+            wp:
+              path: data/LRG/wp_LRG_z0.4-0.6_FSF_LOGMSTAR11.08-11.167_combined-FSF_GCcomb.txt
+              column: 1
+            number_density:
+              {value: 1.27e-4, error: 1.27e-5, mode: gaussian_two_sided, source: hmf}
+          sm2:
+            wp:
+              path: data/LRG/wp_LRG_z0.4-0.6_FSF_LOGMSTAR11.167-11.278_combined-FSF_GCcomb.txt
+              column: 1
+            number_density:
+              {value: 1.27e-4, error: 1.27e-5, mode: gaussian_two_sided, source: hmf}
+          sm3:
+            wp:
+              path: data/LRG/wp_LRG_z0.4-0.6_FSF_LOGMSTAR11.278-13.191_combined-FSF_GCcomb.txt
+              column: 1
+            number_density:
+              {value: 1.27e-4, error: 1.27e-5, mode: gaussian_two_sided, source: hmf}
+
+  covariance:
+    mode: block
+    inversion: inv
+    covariance_n_mocks: null
+    precision_scale: 1.0
+    blocks:
+      - observables: [LRG.sm0.wp]
+        path: data/LRG/cov_diag_LRG_z0.4-0.6_FSF_LOGMSTAR7.387-11.08_combined-FSF_GCcomb.txt
+      - observables: [LRG.sm1.wp]
+        path: data/LRG/cov_diag_LRG_z0.4-0.6_FSF_LOGMSTAR11.08-11.167_combined-FSF_GCcomb.txt
+      - observables: [LRG.sm2.wp]
+        path: data/LRG/cov_diag_LRG_z0.4-0.6_FSF_LOGMSTAR11.167-11.278_combined-FSF_GCcomb.txt
+      - observables: [LRG.sm3.wp]
+        path: data/LRG/cov_diag_LRG_z0.4-0.6_FSF_LOGMSTAR11.278-13.191_combined-FSF_GCcomb.txt
+
+  theory:
+    tracers:
+      LRG:
+        fixed_params:
+          logMh_delta_pivot: 14.0
+          width_cen_bend: 1.0
+        stellar_mass:
+          samples:
+            sm0: 0
+            sm1: 1
+            sm2: 2
+            sm3: 3
+        paircounts:
+          rppi:
+            path: AbacusTabulation_data/paircounts/AbacusSummit_base_c000_ph000/z0.500/clustering/paircounts_clustering_rppi_pos-rsd_abacustab-profiles-conc-r98-L2com-over-r25-L2com_m40.h5
+            position_dataset: pos_rsd
+
+  # List form replaces the inherited scalar-LRG parameter mapping completely.
+  parameters:
+    - {name: logMcut, initial: 13.0, min: 12.0, max: 14.5}
+    - {name: sigma, initial: 0.4, min: 0.001, max: 1.5}
+    - {name: logM1, initial: 14.0, min: 12.5, max: 15.5}
+    - {name: kappa, initial: 1.0, min: 0.1, max: 3.0}
+    - {name: alpha, initial: 1.0, min: 0.2, max: 2.0}
+    - {name: a_c, initial: 1.0, min: 0.1, max: 1.5}
+    - {name: logMstar_cen_bend, initial: 11.2, min: 10.5, max: 12.0}
+    - {name: logMh_cen_bend, initial: 13.5, min: 12.0, max: 15.0}
+    - {name: beta_cen_low, initial: 0.5, min: 0.0, max: 3.0}
+    - {name: beta_cen_high, initial: 0.2, min: 0.0, max: 1.0}
+    - {name: sigma_logMstar_cen, initial: 0.18, min: 0.05, max: 0.6}
+    - {name: alpha_star_sat, initial: -1.2, min: -2.5, max: 2.5}
+    - {name: delta_cs_pivot, initial: 0.4, min: 0.0, max: 1.5}
+    - {name: delta_cs_gradient, initial: 0.05, min: -0.5, max: 0.5}
+
+  parameter_constraints:
+    - {lower: beta_cen_high, upper: beta_cen_low}
+
+  output:
+    output_dir: tests/fit_outputs/lrg_stellar_mass_z0p5
+    prefix: lrg_stellar_mass_z0p5_wp_open_nd10pct
+
+  postprocess:
+    enabled: true
+    optimization: true
+    mcmc: true
+    fail_on_error: true
+    n_processes: 1
+
+  optimization:
+    method: differential_evolution
+    target: posterior
+    native_threads_per_process: 1
+    multiprocessing_start_method: fork
+    start:
+      - 12.802822911286412
+      - 0.13235090944190023
+      - 13.996488657981823
+      - 0.893239706330484
+      - 0.9805979305126575
+      - 0.7190726154791128
+      - 11.431561662296268
+      - 13.905682590147288
+      - 0.3333427157877334
+      - 0.2341009455446147
+      - 0.13800100023031436
+      - 2.2549986685797903
+      - 0.36183131752266007
+      - 0.24594538226463358
+    options:
+      maxiter: 300
+      popsize: 8
+      tol: 1.0e-4
+      polish: true
+      seed: 20260724
+      workers: 16
+      updating: deferred
+      disp: false
+      x0:
+        - 12.802822911286412
+        - 0.13235090944190023
+        - 13.996488657981823
+        - 0.893239706330484
+        - 0.9805979305126575
+        - 0.7190726154791128
+        - 11.431561662296268
+        - 13.905682590147288
+        - 0.3333427157877334
+        - 0.2341009455446147
+        - 0.13800100023031436
+        - 2.2549986685797903
+        - 0.36183131752266007
+        - 0.24594538226463358
+
+  mcmc:
+    pocomc:
+      use_mpi: false
+      n_processes: 16
+      native_threads_per_process: 1
+      multiprocessing_start_method: fork
+      resume_state_path: null
+      sampler:
+        n_effective: 512
+        n_active: 256
+        random_state: 20260724
+      run:
+        n_total: 4096
+        n_evidence: 4096
+        save_every: 5

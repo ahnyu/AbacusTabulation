@@ -671,8 +671,10 @@ def hod_satellite_fraction(
 ) -> float:
     """Return n_sat / (n_cen + n_sat)."""
 
-    n_cen = hod_central_number_density(hmf, hod_params, hod_model=hod_model)
-    n_sat = hod_satellite_number_density(hmf, hod_params, hod_model=hod_model)
+    cen, sat = hod_occupation_on_hmf(hmf, hod_params, hod_model=hod_model)
+    weights = hmf_density_weights(hmf)
+    n_cen = float(np.sum(cen * weights))
+    n_sat = float(np.sum(sat * weights))
     total = n_cen + n_sat
     return float(n_sat / total) if total > 0.0 else np.nan
 
@@ -854,11 +856,17 @@ def hod_derived_quantities(
 ) -> HODDerivedQuantities:
     """Convenience wrapper returning the common HOD-derived quantities."""
 
-    n_cen = hod_central_number_density(hmf, hod_params, hod_model=hod_model)
-    n_sat = hod_satellite_number_density(hmf, hod_params, hod_model=hod_model)
+    central, satellite = hod_occupation_on_hmf(
+        hmf,
+        hod_params,
+        hod_model=hod_model,
+    )
+    density_weights = hmf_density_weights(hmf)
+    n_cen = float(np.sum(central * density_weights))
+    n_sat = float(np.sum(satellite * density_weights))
     n_gal = n_cen + n_sat
-    log10_cen = hod_central_median_log10_host_mass(hmf, hod_params, hod_model=hod_model)
-    log10_sat = hod_satellite_median_log10_host_mass(hmf, hod_params, hod_model=hod_model)
+    log10_cen = _weighted_median_log10_host_mass(hmf, central)
+    log10_sat = _weighted_median_log10_host_mass(hmf, satellite)
     return HODDerivedQuantities(
         n_cen=n_cen,
         n_sat=n_sat,

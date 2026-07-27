@@ -37,6 +37,30 @@ def merge_configs(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[
     return merged
 
 
+def resolve_hod_model_from_config(
+    config: Mapping[str, Any],
+    *,
+    tracer: str | None = None,
+    default: str = "lrg",
+) -> str:
+    """Resolve the single configured HOD model for a tracer."""
+
+    local = None
+    if tracer is not None:
+        local = (
+            (config.get("fit") or {})
+            .get("theory", {})
+            .get("tracers", {})
+            .get(str(tracer), {})
+            .get("hod_model")
+        )
+    global_model = (config.get("hod") or {}).get("model")
+    for value in (local, global_model, default):
+        if value is not None:
+            return str(value)
+    return str(default)
+
+
 def _load_config(path: Path, *, stack: tuple[Path, ...]) -> dict[str, Any]:
     import yaml
 

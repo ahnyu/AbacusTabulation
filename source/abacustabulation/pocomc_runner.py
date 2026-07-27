@@ -68,6 +68,10 @@ def _run_sampler(
 ) -> Any:
     config = problem.fit_config.get("mcmc", {}).get("pocomc", {})
     sampler_kwargs = dict(config.get("sampler", {}))
+    sampler_kwargs.setdefault(
+        "pytorch_threads",
+        int(config.get("native_threads_per_process", 1)),
+    )
     run_kwargs = dict(config.get("run", {"n_total": 4096, "save_every": 5}))
     if resume_state_path is not None:
         run_kwargs["resume_state_path"] = resume_state_path
@@ -114,6 +118,10 @@ def run_pocomc(
     resume_state_path = resume_state_path_override or config.get("resume_state_path")
     use_mpi = bool(config.get("use_mpi", False)) and not disable_mpi
     n_processes = _configured_n_processes(n_processes_override, config)
+    local_start_method = (
+        multiprocessing_start_method_override
+        or config.get("multiprocessing_start_method", "fork")
+    )
     if use_mpi and n_processes > 1:
         raise ValueError(
             "Use either MPI or local multiprocessing, not both; "
@@ -132,11 +140,7 @@ def run_pocomc(
                 resume_state_path=resume_state_path,
             )
     elif n_processes > 1:
-        start_method = (
-            multiprocessing_start_method_override
-            or config.get("multiprocessing_start_method", "fork")
-        )
-        context = _multiprocessing_context(start_method)
+        context = _multiprocessing_context(local_start_method)
         _set_multiprocessing_problem(problem)
         print(
             f"using local multiprocessing pool with {n_processes} processes",
@@ -186,6 +190,13 @@ def run_pocomc(
 
     derived_summary = {}
     try:
+        post_config = problem.fit_config.get("postprocess", {})
+        derived_n_processes = int(
+            post_config.get(
+                "n_processes",
+                1 if use_mpi else n_processes,
+            )
+        )
         derived_summary = write_mcmc_derived(
             problem,
             samples,
@@ -194,6 +205,13 @@ def run_pocomc(
             logprior,
             output_dir,
             prefix,
+            n_processes=derived_n_processes,
+            multiprocessing_start_method=str(
+                post_config.get(
+                    "multiprocessing_start_method",
+                    local_start_method,
+                )
+            ),
         )
     except Exception as exc:
         if _postprocess_fail_on_error(problem):

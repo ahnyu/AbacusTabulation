@@ -17,7 +17,7 @@ import numpy as np
 
 from .config import load_config
 from .fitting import HODFittingProblem
-from .hod import evaluate_hod
+from .hod import evaluate_hod, evaluate_hod_splits
 
 
 DEFAULT_FIGSIZE_PER_PANEL = (8.0, 6.0)
@@ -51,6 +51,16 @@ DEFAULT_PARAMETER_LABELS = {
     "mh_cen_med": r"$\widetilde{M}_{\rm h,cen}$",
     "mh_sat_med": r"$\widetilde{M}_{\rm h,sat}$",
     "linear_bias": r"$b_{\rm lin}$",
+    "logMstar_cen_bend": r"$\log M_{\star,\rm cen}^{\rm bend}$",
+    "logMh_cen_bend": r"$\log M_{\rm h,cen}^{\rm bend}$",
+    "beta_cen_low": r"$\beta_{\rm cen}^{\rm low}$",
+    "beta_cen_high": r"$\beta_{\rm cen}^{\rm high}$",
+    "sigma_logMstar_cen": r"$\sigma_{\log M_\star,\rm cen}$",
+    "width_cen_bend": r"$w_{\rm cen}^{\rm bend}$",
+    "alpha_star_sat": r"$\alpha_{\star,\rm sat}$",
+    "delta_cs_pivot": r"$\Delta_{\rm cs}^{\rm pivot}$",
+    "delta_cs_gradient": r"$\nabla\Delta_{\rm cs}$",
+    "logMh_delta_pivot": r"$\log M_{\rm h,\Delta}^{\rm pivot}$",
 }
 
 
@@ -141,6 +151,15 @@ class HODBand:
     total_lower: np.ndarray
     total_upper: np.ndarray
     label: str | None = None
+
+
+@dataclass(frozen=True)
+class StellarMassHODBands:
+    """Posterior HOD bands for every configured stellar-mass split."""
+
+    tracer: str
+    split_names: tuple[str, ...]
+    bands: tuple[HODBand, ...]
 
 
 @dataclass(frozen=True)
@@ -528,7 +547,10 @@ def _build_getdist_samples(
     label_map = _selected_label_map(selected_names, labels)
     getdist_names = _getdist_name_map((*selection.base_names, *selection.derived_names))
     base_getdist_names = [getdist_names[name] for name in selection.base_names]
-    base_labels = [label_map.get(name, name) for name in selection.base_names]
+    base_labels = [
+        _getdist_label(label_map.get(name, name))
+        for name in selection.base_names
+    ]
     kwargs = dict(settings=settings or {})
     if chain.label is not None:
         kwargs["label"] = str(chain.label)
@@ -547,7 +569,7 @@ def _build_getdist_samples(
             samples.addDerived(
                 chain.derived[:, index],
                 name=getdist_names[name],
-                label=label_map.get(name, name),
+                label=_getdist_label(label_map.get(name, name)),
             )
     return samples
 
@@ -870,11 +892,16 @@ def hod_bands_from_fit(
     """Evaluate central, satellite, and total HOD bands for one loaded fit."""
 
     tracer = str(tracer or fit.problem.tracers[0])
+    if tracer in fit.problem.stellar_mass_specs:
+        raise ValueError(
+            f"Tracer {tracer!r} uses stellar-mass splits; call "
+            "stellar_mass_hod_bands_from_fit() instead."
+        )
     if logm is None:
         logm = np.linspace(11.0, 15.5, 256)
     logm = np.asarray(logm, dtype=np.float64)
     mass = 10.0**logm
-    model = str(hod_model or fit.problem._hod_model_for_tracer(tracer))
+    model = str(hod_model or fit.problem.hod_model_for_tracer(tracer))
     samples, weights = _selected_samples(fit.chain, max_samples=max_samples, random_state=random_state)
     central = []
     satellite = []
@@ -909,6 +936,174 @@ def hod_bands_from_fits(fits: Sequence[FitPlotData], **kwargs: Any) -> list[HODB
     """Evaluate HOD bands for several loaded fits."""
 
     return [hod_bands_from_fit(fit, **kwargs) for fit in _fit_plot_data_list(fits)]
+
+
+def stellar_mass_hod_bands_from_fit(
+    fit: FitPlotData,
+    *,
+    tracer: str | None = None,
+    logm: np.ndarray | None = None,
+    hod_model: str | None = None,
+    max_samples: int | None = None,
+    random_state: int | np.random.Generator | None = None,
+    quantiles: tuple[float, float] = DEFAULT_BAND_QUANTILES,
+) -> StellarMassHODBands:
+    """Evaluate HOD bands for every configured stellar-mass split."""
+
+    tracer = str(tracer or fit.problem.tracers[0])
+    try:
+        spec = fit.problem.stellar_mass_specs[tracer]
+    except KeyError as exc:
+        raise ValueError(
+            f"Tracer {tracer!r} does not configure stellar-mass splits."
+        ) from exc
+    if logm is None:
+        logm = np.linspace(11.0, 15.5, 256)
+    logm = np.asarray(logm, dtype=np.float64)
+    mass = 10.0**logm
+    model = str(hod_model or fit.problem.hod_model_for_tracer(tracer))
+    samples, weights = _selected_samples(
+        fit.chain,
+        max_samples=max_samples,
+        random_state=random_state,
+    )
+    central = []
+    satellite = []
+    for theta in samples:
+        params = fit.problem.params_for_tracer(theta, tracer)
+        cen, sat = evaluate_hod_splits(
+            mass,
+            params,
+            model=model,
+            split_method=spec.split_method,
+            logmstar_edges=spec.logmstar_edges,
+            redshift_weights=spec.redshift_weights,
+        )
+        central.append(cen)
+        satellite.append(sat)
+    central = np.asarray(central, dtype=np.float64)
+    satellite = np.asarray(satellite, dtype=np.float64)
+    split_names = _stellar_sample_names(spec.samples, spec.n_splits)
+    bands = []
+    for index, split_name in enumerate(split_names):
+        cen_mean, cen_low, cen_high = _weighted_mean_interval(
+            central[:, index],
+            weights,
+            quantiles=quantiles,
+        )
+        sat_mean, sat_low, sat_high = _weighted_mean_interval(
+            satellite[:, index],
+            weights,
+            quantiles=quantiles,
+        )
+        total = central[:, index] + satellite[:, index]
+        tot_mean, tot_low, tot_high = _weighted_mean_interval(
+            total,
+            weights,
+            quantiles=quantiles,
+        )
+        bands.append(
+            HODBand(
+                tracer=tracer,
+                logm=logm,
+                central_mean=cen_mean,
+                central_lower=cen_low,
+                central_upper=cen_high,
+                satellite_mean=sat_mean,
+                satellite_lower=sat_low,
+                satellite_upper=sat_high,
+                total_mean=tot_mean,
+                total_lower=tot_low,
+                total_upper=tot_high,
+                label=split_name,
+            )
+        )
+    return StellarMassHODBands(
+        tracer=tracer,
+        split_names=split_names,
+        bands=tuple(bands),
+    )
+
+
+def plot_stellar_mass_hod_bands(
+    fit: FitPlotData,
+    *,
+    components: Sequence[str] = ("central", "satellite"),
+    labels: Sequence[str] | None = None,
+    figsize: tuple[float, float] = DEFAULT_FIGSIZE_PER_PANEL,
+    labelsize: float | None = None,
+    legendsize: float | None = None,
+    ticksize: float | None = None,
+    font_scale: float | None = None,
+    alpha: float = 0.25,
+    show_band: Sequence[bool] | bool | None = None,
+    yscale: str | None = "log",
+    ylim: tuple[float, float] | None = (1.0e-3, 10.0**1.5),
+    **band_kwargs: Any,
+):
+    """Plot central and satellite HOD bands for one stellar-mass fit."""
+
+    plt = _matplotlib_pyplot()
+    labelsize, legendsize, ticksize = _resolved_plot_style_sizes(
+        figsize,
+        labelsize=labelsize,
+        legendsize=legendsize,
+        ticksize=ticksize,
+        font_scale=font_scale,
+    )
+    result = stellar_mass_hod_bands_from_fit(fit, **band_kwargs)
+    plot_labels = (
+        list(result.split_names)
+        if labels is None
+        else _plot_labels(labels, len(result.bands))
+    )
+    show_bands = _show_band_flags(show_band, len(result.bands))
+    fig, ax = plt.subplots(figsize=figsize)
+    linestyles = {"central": "-", "satellite": "--", "total": ":"}
+    handles = []
+    legend_labels = []
+    for band, split_label, draw_band in zip(
+        result.bands,
+        plot_labels,
+        show_bands,
+        strict=True,
+    ):
+        color = _next_axis_color(ax)
+        handles.append(_color_block_handle(color))
+        legend_labels.append(split_label)
+        for component in components:
+            mean, lower, upper = _hod_component_arrays(band, component)
+            mean, lower, upper = _hod_plot_values(
+                mean,
+                lower,
+                upper,
+                yscale=yscale,
+            )
+            ax.plot(
+                band.logm,
+                mean,
+                color=color,
+                linestyle=linestyles.get(component, "-"),
+            )
+            if draw_band:
+                ax.fill_between(
+                    band.logm,
+                    lower,
+                    upper,
+                    color=color,
+                    alpha=alpha,
+                    linewidth=0,
+                )
+    if yscale is not None:
+        ax.set_yscale(yscale)
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+    ax.set_xlabel(r"$\log_{10}(M_h/[M_\odot/h])$", fontsize=labelsize)
+    ax.set_ylabel(r"$\langle N \rangle$", fontsize=labelsize)
+    _style_axis(ax, ticksize=ticksize, legendsize=legendsize)
+    ax.legend(handles, legend_labels, fontsize=legendsize)
+    fig.tight_layout()
+    return fig, ax
 
 
 def plot_hod_bands(
@@ -1624,6 +1819,17 @@ def _selected_label_map(names: Sequence[str], labels: Mapping[str, str] | Sequen
     return {name: str(label) for name, label in zip(selected, labels, strict=True)}
 
 
+def _getdist_label(value: Any) -> str:
+    """Remove math delimiters because GetDist supplies them when rendering."""
+
+    label = str(value)
+    if label.startswith("$$") and label.endswith("$$") and len(label) >= 4:
+        return label[2:-2]
+    if label.startswith("$") and label.endswith("$") and len(label) >= 2:
+        return label[1:-1]
+    return label
+
+
 def _unique_getdist_names(names: Sequence[str]) -> list[str]:
     out = []
     used: dict[str, int] = {}
@@ -1650,6 +1856,25 @@ def _getdist_plot_params(chain: ChainSamples, params: Sequence[str] | None) -> l
     return [getdist_names[str(name)] for name in selection.selected_names]
 
 
+def _stellar_sample_names(
+    samples: Mapping[str, int],
+    n_splits: int,
+) -> tuple[str, ...]:
+    names_by_index = {int(index): str(name) for name, index in samples.items()}
+    used = set(names_by_index.values())
+    names = []
+    for index in range(n_splits):
+        if index in names_by_index:
+            names.append(names_by_index[index])
+            continue
+        fallback = f"sm{index}"
+        if fallback in used:
+            fallback = f"split{index}"
+        used.add(fallback)
+        names.append(fallback)
+    return tuple(names)
+
+
 def _selected_samples(
     chain: ChainSamples,
     *,
@@ -1657,19 +1882,22 @@ def _selected_samples(
     random_state: int | np.random.Generator | None,
 ) -> tuple[np.ndarray, np.ndarray]:
     weights = chain.normalized_weights()
-    if max_samples is None or chain.size <= int(max_samples):
+    if max_samples is None:
+        return chain.samples, weights
+    max_samples = int(max_samples)
+    if max_samples <= 0:
+        raise ValueError("max_samples must be positive.")
+    if chain.size <= max_samples:
         return chain.samples, weights
     positive = np.flatnonzero(weights > 0.0)
-    if positive.size <= int(max_samples):
+    if positive.size <= max_samples:
         selected_weights = weights[positive]
         selected_weights = selected_weights / np.sum(selected_weights)
         return chain.samples[positive], selected_weights
     rng = random_state if isinstance(random_state, np.random.Generator) else np.random.default_rng(random_state)
-    positive_weights = weights[positive] / np.sum(weights[positive])
-    indices = rng.choice(positive, size=int(max_samples), replace=False, p=positive_weights)
-    selected_weights = weights[indices]
-    selected_weights = selected_weights / np.sum(selected_weights)
-    return chain.samples[indices], selected_weights
+    indices = rng.choice(chain.size, size=max_samples, replace=True, p=weights)
+    selected, counts = np.unique(indices, return_counts=True)
+    return chain.samples[selected], counts.astype(np.float64) / max_samples
 
 
 def _weighted_mean_interval(

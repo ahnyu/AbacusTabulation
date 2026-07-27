@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 from typing import Any, Mapping
 
 import h5py
 import numpy as np
 
-from .hod import evaluate_hod, evaluate_hod_splits
-from .hod_models.lrg_stellar_mass import normalize_stellar_mass_selection
+from .hod import evaluate_hod, evaluate_hod_splits, hod_model_supports_splits
+from .stellar_mass import normalize_stellar_mass_selection
 
 
 @dataclass
@@ -41,6 +42,7 @@ class HODBinWeights:
     n_centrals: float
     n_satellites: float
     subbin_weighting: str = "halo_count"
+    weight_grid_key: str | None = None
 
 
 @dataclass
@@ -99,6 +101,26 @@ class StellarMassClusteringResult:
     @property
     def number_density(self) -> np.ndarray:
         return np.asarray([result.number_density for result in self.clusterings])
+
+
+def _weight_grid_key(paircounts: PairCountTable) -> str:
+    digest = hashlib.blake2b(digest_size=16)
+    arrays = (
+        paircounts.mass_edges_log10,
+        paircounts.mass_subbin_centers_log10,
+        paircounts.num_halo_subbin,
+        paircounts.num_halo,
+        paircounts.num_particle,
+    )
+    for value in arrays:
+        if value is None:
+            digest.update(b"none")
+            continue
+        array = np.ascontiguousarray(value)
+        digest.update(str(array.dtype).encode("ascii"))
+        digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+        digest.update(array.tobytes())
+    return digest.hexdigest()
 
 
 def _decode_attr(value: Any) -> Any:
@@ -160,6 +182,7 @@ def _hod_weights_from_subcenters(
     *,
     hod_model: str,
     num_halo_subbin: np.ndarray,
+    weight_grid_key: str | None = None,
 ) -> HODBinWeights:
     edges = np.asarray(mass_edges_log10, dtype=np.float64)
     subcenters = np.asarray(mass_subcenters_log10, dtype=np.float64)
@@ -207,6 +230,7 @@ def _hod_weights_from_subcenters(
         n_centrals=n_centrals,
         n_satellites=n_satellites,
         subbin_weighting="halo_count",
+        weight_grid_key=weight_grid_key,
     )
 
 
@@ -222,6 +246,7 @@ def _stellar_mass_weights_from_subcenters(
     logmstar_edges: Any,
     redshift_weights: Any,
     num_halo_subbin: np.ndarray,
+    weight_grid_key: str | None = None,
 ) -> tuple[HODBinWeights, ...]:
     """Build halo-count-weighted HOD weights for every stellar-mass split."""
 
@@ -304,6 +329,7 @@ def _stellar_mass_weights_from_subcenters(
             n_centrals=float(n_centrals[index]),
             n_satellites=float(n_satellites[index]),
             subbin_weighting="halo_count",
+            weight_grid_key=weight_grid_key,
         )
         for index in range(central.shape[0])
     )
@@ -375,14 +401,15 @@ def hod_weights_for_paircounts(
     """Compute refined HOD weights matching a paircount table's mass bins."""
 
     subcenters, subcounts = _paircount_subbin_data(paircounts)
-    return refined_hod_bin_weights(
+    return _hod_weights_from_subcenters(
         paircounts.mass_edges_log10,
+        subcenters,
         paircounts.num_halo,
         paircounts.num_particle,
         hod_params,
         hod_model=hod_model,
-        mass_subcenters_log10=subcenters,
         num_halo_subbin=subcounts,
+        weight_grid_key=_weight_grid_key(paircounts),
     )
 
 
@@ -477,6 +504,7 @@ class HODClusteringTabulator:
         self.n_subbins = int(self.num_halo_subbin.shape[1])
         self.bin_shape = tuple(paircounts.counts_hh.shape[2:])
         self.random_geometry = random_geometry_factor(paircounts)
+        self.weight_grid_key = _weight_grid_key(paircounts)
         self._hh = self._flatten_counts(paircounts.counts_hh)
         self._hp = self._flatten_counts(paircounts.counts_hp)
         self._pp = self._flatten_counts(paircounts.counts_pp)
@@ -504,6 +532,7 @@ class HODClusteringTabulator:
             hod_params,
             hod_model=hod_model,
             num_halo_subbin=self.num_halo_subbin,
+            weight_grid_key=self.weight_grid_key,
         )
 
     def stellar_mass_hod_weights(
@@ -528,6 +557,7 @@ class HODClusteringTabulator:
             logmstar_edges=logmstar_edges,
             redshift_weights=redshift_weights,
             num_halo_subbin=self.num_halo_subbin,
+            weight_grid_key=self.weight_grid_key,
         )
 
     def _weighted_auto_paircounts_batch(
@@ -536,6 +566,8 @@ class HODClusteringTabulator:
     ) -> np.ndarray:
         if not weights:
             raise ValueError("At least one stellar-mass split is required.")
+        for item in weights:
+            self._validate_weight_grid(item)
         central = np.stack([item.central for item in weights], axis=0)
         particle = np.stack([item.particle for item in weights], axis=0)
         w_hh = (central[:, :, None] * central[:, None, :]).reshape(len(weights), -1)
@@ -557,19 +589,36 @@ class HODClusteringTabulator:
     ) -> StellarMassClusteringResult:
         """Return auto-clustering for every stellar-mass split in edge order."""
 
-        normalized_edges, normalized_redshift_weights = (
-            normalize_stellar_mass_selection(
-                split_method,
-                logmstar_edges,
-                redshift_weights,
-            )
-        )
         weights = self.stellar_mass_hod_weights(
             hod_params,
             split_method=split_method,
             logmstar_edges=logmstar_edges,
             redshift_weights=redshift_weights,
             hod_model=hod_model,
+        )
+        return self.stellar_mass_correlations_from_weights(
+            weights,
+            split_method=split_method,
+            logmstar_edges=logmstar_edges,
+            redshift_weights=redshift_weights,
+        )
+
+    def stellar_mass_correlations_from_weights(
+        self,
+        weights: tuple[HODBinWeights, ...],
+        *,
+        split_method: str,
+        logmstar_edges: Any,
+        redshift_weights: Any = None,
+    ) -> StellarMassClusteringResult:
+        """Return all split correlations from precomputed compatible weights."""
+
+        normalized_edges, normalized_redshift_weights = (
+            normalize_stellar_mass_selection(
+                split_method,
+                logmstar_edges,
+                redshift_weights,
+            )
         )
         expected_splits = normalized_edges.shape[1] - 1
         if len(weights) != expected_splits:
@@ -616,6 +665,9 @@ class HODClusteringTabulator:
         weights_a: HODBinWeights,
         weights_b: HODBinWeights | None = None,
     ) -> np.ndarray:
+        self._validate_weight_grid(weights_a)
+        if weights_b is not None:
+            self._validate_weight_grid(weights_b)
         ca = weights_a.central
         pa = weights_a.particle
         if weights_b is None:
@@ -632,6 +684,20 @@ class HODClusteringTabulator:
         dd = w_hh @ self._hh + w_hp @ self._hp + w_pp @ self._pp
         return dd.reshape(self.bin_shape)
 
+    def _validate_weight_grid(self, weights: HODBinWeights) -> None:
+        if (
+            weights.weight_grid_key is not None
+            and weights.weight_grid_key != self.weight_grid_key
+        ):
+            raise ValueError(
+                "HOD weights were computed for a different paircount mass grid."
+            )
+        nmass = self.paircounts.num_halo.size
+        if weights.central.shape != (nmass,) or weights.particle.shape != (nmass,):
+            raise ValueError(
+                f"HOD weights must have shape ({nmass},) for this paircount table."
+            )
+
     def correlation(
         self,
         hod_params: Mapping[str, Any],
@@ -639,6 +705,14 @@ class HODClusteringTabulator:
         hod_model: str = "lrg",
     ) -> GalaxyClusteringResult:
         weights = self.hod_weights(hod_params, hod_model=hod_model)
+        return self.correlation_from_weights(weights)
+
+    def correlation_from_weights(
+        self,
+        weights: HODBinWeights,
+    ) -> GalaxyClusteringResult:
+        """Return auto-correlation from precomputed compatible HOD weights."""
+
         dd = self.weighted_paircounts(weights)
         rr = weights.n_galaxies**2 * self.random_geometry
         xi = np.divide(dd, rr, out=np.full_like(dd, np.nan, dtype=np.float64), where=rr > 0.0) - 1.0
@@ -780,15 +854,80 @@ def galaxy_correlation_from_config(
 
     config = load_config(path2config)
 
-    sim_params = config.get("sim_params", {})
-    pair_params = config.get("paircounts", {})
     hod_params = config.get("hod", {})
     if "params" not in hod_params:
         raise KeyError("Set hod.params in the config, or call galaxy_correlation_from_paircounts directly.")
+    hod_model = str(hod_params.get("model", "lrg"))
+    if hod_params.get("stellar_mass") is not None or hod_model_supports_splits(
+        hod_model
+    ):
+        raise ValueError(
+            "This config uses a split HOD; call "
+            "stellar_mass_correlations_from_config() instead."
+        )
 
+    paircount_path = _paircount_path_for_clustering_config(
+        config,
+        paircount_path=paircount_path,
+        clustering=clustering,
+        position_dataset=position_dataset,
+    )
+
+    return galaxy_correlation_from_paircounts(
+        paircount_path,
+        hod_params["params"],
+        hod_model=hod_model,
+    )
+
+
+def stellar_mass_correlations_from_config(
+    path2config: str | Path,
+    *,
+    paircount_path: str | Path | None = None,
+    clustering: str | None = None,
+    position_dataset: str | None = None,
+) -> StellarMassClusteringResult:
+    """Evaluate every configured stellar-mass split from the universal config."""
+
+    from .config import load_config
+
+    config = load_config(path2config)
+    hod_config = config.get("hod", {})
+    if "params" not in hod_config:
+        raise KeyError("Set hod.params in the config.")
+    selection = hod_config.get("stellar_mass")
+    if not isinstance(selection, Mapping):
+        raise KeyError("Set hod.stellar_mass in the config.")
+    paircount_path = _paircount_path_for_clustering_config(
+        config,
+        paircount_path=paircount_path,
+        clustering=clustering,
+        position_dataset=position_dataset,
+    )
+    return stellar_mass_correlations_from_paircounts(
+        paircount_path,
+        hod_config["params"],
+        split_method=str(selection["split_method"]),
+        logmstar_edges=selection["logmstar_edges"],
+        redshift_weights=selection.get("redshift_weights"),
+        hod_model=str(hod_config.get("model", "lrg_stellar_mass")),
+    )
+
+
+def _paircount_path_for_clustering_config(
+    config: Mapping[str, Any],
+    *,
+    paircount_path: str | Path | None,
+    clustering: str | None,
+    position_dataset: str | None,
+) -> Path:
+    pair_params = config.get("paircounts", {})
     jobs = pair_params.get("jobs") or {}
     job_params = dict(jobs.get("clustering", {})) if jobs else {}
-    configured_modes = job_params.get("clustering", pair_params.get("clustering", ["rppi"]))
+    configured_modes = job_params.get(
+        "clustering",
+        pair_params.get("clustering", ["rppi"]),
+    )
     if clustering is not None:
         mode = str(clustering)
     elif isinstance(configured_modes, list):
@@ -797,25 +936,19 @@ def galaxy_correlation_from_config(
         mode = str(configured_modes)
     if "," in mode:
         mode = mode.split(",", 1)[0].strip()
+    if paircount_path is not None:
+        return Path(paircount_path)
 
-    if paircount_path is None:
-        from .paircounts import resolve_paircount_path_from_config
+    from .paircounts import resolve_paircount_path_from_config
 
-        path_config: dict[str, Any] = {}
-        if jobs:
-            path_config["job"] = "clustering"
-        if position_dataset is not None:
-            path_config["position_dataset"] = position_dataset
-        paircount_path = resolve_paircount_path_from_config(
-            config,
-            clustering=mode,
-            path_config=path_config,
-            job_name="clustering" if jobs else None,
-        )
-
-    return galaxy_correlation_from_paircounts(
-        paircount_path,
-        hod_params["params"],
-        hod_model=str(hod_params.get("model", "lrg")),
+    path_config: dict[str, Any] = {}
+    if jobs:
+        path_config["job"] = "clustering"
+    if position_dataset is not None:
+        path_config["position_dataset"] = position_dataset
+    return resolve_paircount_path_from_config(
+        config,
+        clustering=mode,
+        path_config=path_config,
+        job_name="clustering" if jobs else None,
     )
-

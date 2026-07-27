@@ -1,10 +1,7 @@
 """LRG HOD split by raw or redshift-relative stellar-mass rank.
 
-This module is deliberately self-contained so that the property-dependent HOD
-can be exercised before the joint multi-sample fitting infrastructure is
-added.  It keeps the existing :mod:`.lrg` Zheng07 parent occupation unchanged
-and multiplies it by central and satellite stellar-mass selection
-probabilities.
+It keeps the existing :mod:`.lrg` Zheng07 parent occupation unchanged and
+multiplies it by central and satellite stellar-mass selection probabilities.
 
 ``selection.logMstar_edges`` contains the complete, contiguous partition of
 the selected parent sample:
@@ -18,7 +15,7 @@ For example, the fixed ``selection`` metadata can be written as::
     selection:
       mode: raw
       bin_index: 0
-      logMstar_edges: [10.4, 11.05, 11.30, 11.55, 12.2]
+      logMstar_edges: [10.4, 11.05, 11.30, 11.55, .inf]
 
 or::
 
@@ -26,8 +23,8 @@ or::
       mode: relative
       bin_index: 0
       logMstar_edges:
-        - [10.4, 11.00, 11.25, 11.50, 12.2]
-        - [10.4, 11.08, 11.33, 11.58, 12.2]
+        - [10.4, 11.00, 11.25, 11.50, .inf]
+        - [10.4, 11.08, 11.33, 11.58, .inf]
       redshift_weights: [0.4, 0.6]
 
 Omitting ``redshift_weights`` gives every relative redshift cell equal weight.
@@ -48,6 +45,7 @@ import numpy as np
 
 from .base import param
 from .lrg import evaluate as evaluate_parent_lrg
+from ..stellar_mass import StellarMassSelection
 
 try:  # pragma: no cover - the fallback is for lightweight environments.
     from scipy import special as _special
@@ -85,6 +83,8 @@ _SATELLITE_CUTOFF_POWER = 2.0
 _QUADRATURE_ORDER = 48
 _GL_NODES, _GL_WEIGHTS = np.polynomial.legendre.leggauss(_QUADRATURE_ORDER)
 _LOG_GL_WEIGHTS = np.log(_GL_WEIGHTS)
+_GAMMA_SHAPE_ZERO_TOL = 1.0e-7
+_GAMMA_ASYMPTOTIC_TERMS = 12
 
 
 def central_mean_logmstar(
@@ -269,83 +269,19 @@ def _selection_grid(
     return _selection_grid_from_mapping(selection)
 
 
-def normalize_stellar_mass_selection(
-    split_method: str,
-    logmstar_edges: Any,
-    redshift_weights: Any = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Validate a split definition and return 2D edges and normalized weights."""
-
-    selection = {
-        "mode": split_method,
-        "logMstar_edges": logmstar_edges,
-    }
-    if redshift_weights is not None:
-        selection["redshift_weights"] = redshift_weights
-    return _selection_grid_from_mapping(selection)
-
-
 def _selection_grid_from_mapping(
     selection: Mapping[str, Any],
 ) -> tuple[np.ndarray, np.ndarray]:
-    mode = str(selection.get("mode", "")).lower()
-    if mode not in {"raw", "relative"}:
-        raise ValueError("split_method must be either 'raw' or 'relative'.")
-
     try:
-        edges = np.asarray(selection["logMstar_edges"], dtype=np.float64)
+        edges = selection["logMstar_edges"]
     except KeyError as exc:
         raise KeyError("logmstar_edges is required.") from exc
-    except (TypeError, ValueError) as exc:
-        raise ValueError("logmstar_edges must be a rectangular numeric array.") from exc
-
-    if mode == "raw":
-        if edges.ndim != 1:
-            raise ValueError("Raw logmstar_edges must be one-dimensional.")
-        edges = edges[None, :]
-        if "redshift_weights" in selection:
-            raise ValueError("A raw split must not define redshift_weights.")
-        weights = np.ones(1, dtype=np.float64)
-    else:
-        if edges.ndim != 2:
-            raise ValueError(
-                "Relative logmstar_edges must have shape "
-                "(n_redshift_cells, n_splits + 1)."
-            )
-        if edges.shape[0] == 0:
-            raise ValueError(
-                "Relative logmstar_edges must contain at least one "
-                "redshift-cell row."
-            )
-        weights = np.asarray(
-            selection.get("redshift_weights", np.ones(edges.shape[0])),
-            dtype=np.float64,
-        )
-
-    if edges.shape[1] < 2:
-        raise ValueError("logmstar_edges must define at least one split.")
-    if not np.all(np.isfinite(edges)):
-        raise ValueError(
-            "logmstar_edges must be finite; the outer edges define "
-            "the selected-parent support."
-        )
-    if not np.all(np.diff(edges, axis=1) > 0.0):
-        raise ValueError(
-            "Each row of logmstar_edges must be strictly increasing."
-        )
-
-    if weights.ndim != 1 or weights.size != edges.shape[0]:
-        raise ValueError(
-            "redshift_weights must be one-dimensional and match "
-            "the number of relative edge rows."
-        )
-    if not np.all(np.isfinite(weights)) or np.any(weights < 0.0):
-        raise ValueError("redshift_weights must be finite and non-negative.")
-    weight_scale = float(np.max(weights))
-    if weight_scale <= 0.0:
-        raise ValueError("redshift_weights must have positive total weight.")
-    scaled_weights = weights / weight_scale
-    return edges, scaled_weights / np.sum(scaled_weights)
+    normalized = StellarMassSelection.from_values(
+        str(selection.get("mode", "")),
+        edges,
+        selection.get("redshift_weights"),
+    )
+    return normalized.edge_rows, normalized.normalized_redshift_weights
 
 
 def _bin_index(selection: Mapping[str, Any], n_splits: int) -> int:
@@ -380,6 +316,43 @@ def _satellite_cell_probabilities(
 ) -> np.ndarray:
     lower = edges[:, :-1]
     upper = edges[:, 1:]
+    has_open_upper = bool(np.isposinf(upper[0, -1]))
+    finite_upper = upper[:, :-1] if has_open_upper else upper
+    finite_lower = lower[:, :-1] if has_open_upper else lower
+
+    log_integrals = _satellite_finite_log_integrals(
+        finite_lower,
+        finite_upper,
+        characteristic,
+        alpha_star_sat,
+    )
+    if has_open_upper:
+        log_x = (
+            _LN10
+            * _SATELLITE_CUTOFF_POWER
+            * (lower[:, -1, None] - characteristic[None, :])
+        )
+        gamma_shape = (alpha_star_sat + 1.0) / _SATELLITE_CUTOFF_POWER
+        log_tail = _log_upper_incomplete_gamma(gamma_shape, log_x)
+        log_tail -= math.log(_LN10 * _SATELLITE_CUTOFF_POWER)
+        log_integrals = np.concatenate(
+            [log_integrals, log_tail[:, None, :]],
+            axis=1,
+        )
+    return _normalize_log_intervals(log_integrals)
+
+
+def _satellite_finite_log_integrals(
+    lower: np.ndarray,
+    upper: np.ndarray,
+    characteristic: np.ndarray,
+    alpha_star_sat: float,
+) -> np.ndarray:
+    if lower.shape[1] == 0:
+        return np.empty(
+            (lower.shape[0], 0, characteristic.size),
+            dtype=np.float64,
+        )
     midpoint = 0.5 * (lower + upper)
     half_width = 0.5 * (upper - lower)
 
@@ -399,7 +372,100 @@ def _satellite_cell_probabilities(
             axis=-1,
         )
     )
-    return _normalize_log_intervals(log_integrals)
+    return log_integrals
+
+
+def _log_upper_incomplete_gamma(
+    shape: float,
+    log_x: np.ndarray,
+) -> np.ndarray:
+    """Return ``log(Gamma(shape, exp(log_x)))`` for positive arguments."""
+
+    if _special is None:  # pragma: no cover - scipy is present in production.
+        raise ImportError(
+            "scipy is required for an open-ended stellar-mass interval."
+        )
+
+    log_x = np.asarray(log_x, dtype=np.float64)
+    if not np.all(np.isfinite(log_x)):
+        raise ValueError("The satellite tail integration bounds must be finite.")
+
+    threshold = max(50.0, 2.0 * (abs(shape) + 1.0))
+    use_asymptotic = log_x >= math.log(threshold)
+    out = np.empty_like(log_x)
+    if np.any(use_asymptotic):
+        out[use_asymptotic] = _log_upper_gamma_asymptotic(
+            shape,
+            log_x[use_asymptotic],
+        )
+
+    moderate = ~use_asymptotic
+    if not np.any(moderate):
+        return out
+
+    selected_log_x = log_x[moderate]
+    x = np.exp(selected_log_x)
+    if shape > _GAMMA_SHAPE_ZERO_TOL:
+        values = _positive_log_upper_gamma(shape, x)
+    elif abs(shape) <= _GAMMA_SHAPE_ZERO_TOL:
+        with np.errstate(divide="ignore"):
+            values = np.log(_special.exp1(x))
+    else:
+        shifts = int(math.floor(-shape)) + 1
+        shifted_shape = shape + shifts
+        values = _positive_log_upper_gamma(shifted_shape, x)
+        current_shape = shifted_shape
+        for _ in range(shifts):
+            target_shape = current_shape - 1.0
+            if abs(target_shape) <= _GAMMA_SHAPE_ZERO_TOL:
+                with np.errstate(divide="ignore"):
+                    values = np.log(_special.exp1(x))
+            else:
+                log_leading = target_shape * selected_log_x - x
+                values = (
+                    _log_subtract(log_leading, values)
+                    - math.log(-target_shape)
+                )
+            current_shape = target_shape
+
+    failed = ~np.isfinite(values)
+    if np.any(failed):
+        values[failed] = _log_upper_gamma_asymptotic(
+            shape,
+            selected_log_x[failed],
+        )
+    out[moderate] = values
+    return out
+
+
+def _positive_log_upper_gamma(shape: float, x: np.ndarray) -> np.ndarray:
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return _special.gammaln(shape) + np.log(_special.gammaincc(shape, x))
+
+
+def _log_upper_gamma_asymptotic(
+    shape: float,
+    log_x: np.ndarray,
+) -> np.ndarray:
+    """Large-argument expansion of the upper incomplete gamma function."""
+
+    inverse_x = np.exp(-log_x)
+    term = np.ones_like(log_x)
+    series = np.ones_like(log_x)
+    for order in range(1, _GAMMA_ASYMPTOTIC_TERMS + 1):
+        term *= (shape - order) * inverse_x
+        series += term
+    if np.any(series <= 0.0) or np.any(~np.isfinite(series)):
+        raise FloatingPointError(
+            "The satellite stellar-mass tail expansion did not converge."
+        )
+
+    max_log = math.log(np.finfo(np.float64).max)
+    x = np.exp(np.minimum(log_x, max_log))
+    result = (shape - 1.0) * log_x - x + np.log(series)
+    result = np.asarray(result, dtype=np.float64)
+    result[log_x > max_log] = -np.finfo(np.float64).max
+    return result
 
 
 def _normal_log_interval(lower: np.ndarray, upper: np.ndarray) -> np.ndarray:

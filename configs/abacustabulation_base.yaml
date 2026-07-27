@@ -149,7 +149,6 @@ derived:
 
   tracers:
     LRG:
-      hod_model: lrg
       hmf:
         path: null
 
@@ -157,6 +156,7 @@ derived:
 # abacustabulation.galaxy_correlation_from_config(...) reads this block.
 # HOD parameter names are canonical-only; aliases such as logM_cut or pmax are rejected.
 hod:
+  # Default model for direct clustering, fitting, and derived quantities.
   model: lrg
   params:
     logMcut: 13.0
@@ -204,6 +204,7 @@ fit:
         # mode: none disables this constraint.
         # mode: minimum rejects models below value.
         # mode: gaussian applies a one-sided Gaussian penalty below value.
+        # mode: gaussian_two_sided applies a Gaussian penalty on either side.
         number_density:
           value: null
           mode: none
@@ -230,7 +231,7 @@ fit:
   theory:
     tracers:
       LRG:
-        hod_model: lrg
+        # Optional hod_model here overrides hod.model for this tracer.
         fixed_params: {}
         paircounts:
           rppi:
@@ -249,6 +250,9 @@ fit:
     alpha:   {initial: 1.0,  min: 0.2,  max: 2.0}
     a_c:     {initial: 1.0,  min: 0.0,  max: 1.5}
 
+  # Optional hard ordering constraints. Each entry requires lower <= upper.
+  parameter_constraints: []
+
   output:
     output_dir: /path/to/fit_outputs/{sim_name}/{z}
     prefix: lrg_tabulated
@@ -262,6 +266,8 @@ fit:
   optimization:
     method: Nelder-Mead        # or L-BFGS-B, Powell, differential_evolution
     target: posterior          # posterior includes bounds; like maximizes likelihood only
+    native_threads_per_process: 1
+    multiprocessing_start_method: fork
     options:
       maxiter: 1000
 
@@ -269,6 +275,7 @@ fit:
     pocomc:
       use_mpi: false
       n_processes: 1              # local multiprocessing workers when use_mpi is false
+      native_threads_per_process: 1
       multiprocessing_start_method: fork
       resume_state_path: null
       sampler: {}

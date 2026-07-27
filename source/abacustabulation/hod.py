@@ -96,6 +96,12 @@ def hod_model_parameters(model: str) -> tuple[str, ...]:
     return tuple(sorted(HOD_MODEL_PARAMETERS[_model_key(model)]))
 
 
+def hod_model_supports_splits(model: str) -> bool:
+    """Return whether a model provides batched split occupations."""
+
+    return _model_key(model) in HOD_SPLIT_MODELS
+
+
 def evaluate_hod_splits(
     mass: np.ndarray | float,
     params: Mapping[str, Any],

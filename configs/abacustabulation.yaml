@@ -149,7 +149,6 @@ derived:
 
   tracers:
     LRG:
-      hod_model: lrg
       hmf:
         path: null
 
@@ -157,6 +156,7 @@ derived:
 # abacustabulation.galaxy_correlation_from_config(...) reads this block.
 # HOD parameter names are canonical-only; aliases such as logM_cut or pmax are rejected.
 hod:
+  # Default model for direct clustering, fitting, and derived quantities.
   model: lrg
   params:
     logMcut: 13.0
@@ -204,6 +204,7 @@ fit:
         # mode: none disables this constraint.
         # mode: minimum rejects models below value.
         # mode: gaussian applies a one-sided Gaussian penalty below value.
+        # mode: gaussian_two_sided applies a Gaussian penalty on either side.
         number_density:
           value: null
           mode: none
@@ -230,7 +231,7 @@ fit:
   theory:
     tracers:
       LRG:
-        hod_model: lrg
+        # Optional hod_model here overrides hod.model for this tracer.
         fixed_params: {}
         paircounts:
           rppi:

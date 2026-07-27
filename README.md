@@ -56,18 +56,36 @@ Avoid global CLI overrides like `--position-dataset pos_rsd` when computing both
 ### Evaluate Stellar-Mass Splits
 
 ```python
+import numpy as np
+
 from abacustabulation import HODClusteringTabulator, projected_wp
 
 tabulator = HODClusteringTabulator.from_paircount_file(paircount_path)
 result = tabulator.stellar_mass_correlations(
     hod_params,
     split_method="raw",
-    logmstar_edges=[10.4, 11.05, 11.30, 11.55, 12.2],
+    logmstar_edges=[10.4, 11.05, 11.30, 11.55, np.inf],
 )
 wp_by_split = [projected_wp(item) for item in result.clusterings]
 ```
 
-For `split_method="relative"`, pass a two-dimensional edge array with one row per redshift cell. `redshift_weights=None` gives all cells equal weight; explicit non-negative weights are normalized internally. The model evaluates all splits together and returns them in edge order.
+Use a terminal `np.inf` edge, or `.inf` in YAML, when the last sample contains
+all galaxies above its lower boundary. Finite upper edges remain supported.
+For `split_method="relative"`, pass a two-dimensional edge array with one row
+per redshift cell; every row must use the same finite or open upper boundary.
+`redshift_weights=None` gives all cells equal weight; explicit non-negative
+weights are normalized internally. The model evaluates all splits together and
+returns them in edge order.
+
+The same calculation can be loaded directly from the universal config:
+
+```python
+from abacustabulation import stellar_mass_correlations_from_config
+
+result = stellar_mass_correlations_from_config(
+    "configs/lrg_stellar_mass_override.yaml"
+)
+```
 
 The separate `configs/lrg_stellar_mass_override.yaml` inherits the same base config as the scalar LRG override. It stores the split definition once under `hod.stellar_mass`; HMF and linear-bias derived quantities reuse it:
 
@@ -84,7 +102,7 @@ print(result.values["satellite_fraction"])
 print(result.values["linear_bias"])
 ```
 
-MCMC postprocessing writes split columns as `LRG.sm0.number_density`, `LRG.sm0.linear_bias`, and so on. The dedicated override contains a simultaneous four-split `wp` fit example. `fit.theory.tracers.LRG.stellar_mass.samples` maps stable sample names to edge-interval indices, while each observable and data block uses the corresponding `sample` name.
+MCMC postprocessing uses the configured sample names in columns such as `LRG.sm0.number_density` and `LRG.sm0.linear_bias`. The dedicated override contains a simultaneous four-split `wp` fit example. `fit.theory.tracers.LRG.stellar_mass.samples` maps sample names to edge-interval indices, while each observable and data block uses the corresponding `sample` name.
 
 ## 4. Compute the High-Resolution HMF
 
@@ -111,6 +129,8 @@ python3 scripts/run_fit_pocomc_stellar_mass.py --path2config configs/lrg_stellar
 ```
 
 Use `fit.mcmc.pocomc.use_mpi: true` for MPI runs, or `fit.mcmc.pocomc.n_processes > 1` for local multiprocessing on one node.
+Keep `fit.mcmc.pocomc.native_threads_per_process: 1` for multiprocessing runs to prevent BLAS/OpenMP oversubscription.
+The optimization runner uses the analogous `fit.optimization.native_threads_per_process` setting.
 
 For a fixed HOD parameter, remove it from `fit.parameters` and put it under `fit.theory.tracers.<TRACER>.fixed_params`, for example:
 
@@ -122,6 +142,8 @@ fit:
         fixed_params:
           a_c: 1.0
 ```
+
+`hod.model` is the default model for clustering, fitting, and derived quantities. A multi-tracer fit may override it once per tracer with `fit.theory.tracers.<TRACER>.hod_model`.
 
 ## 6. Derived Quantities and Linear Bias
 
@@ -138,18 +160,21 @@ fit:
 
 If enabled, optimization writes `*_optimum_derived.json`; MCMC writes `*_chains_derived.txt` and `*_derived_summary.json`. MCMC postprocessing evaluates all posterior samples.
 
+When the pocoMC runner uses local multiprocessing, derived postprocessing reuses the same worker count. Set `fit.postprocess.n_processes` only when a different count is needed.
+
 Linear bias requires the `linear_bias` paircount job and `cosmoprimo` in the runtime environment.
 
 ## 7. Plot Fit Outputs
 
 ```python
-from abacustabulation import load_fit_plot_data, plot_derived_parameters, plot_fit_bands, plot_hod_bands, plot_joint_grid, plot_triangle
+from abacustabulation import load_fit_plot_data, plot_derived_parameters, plot_fit_bands, plot_hod_bands, plot_joint_grid, plot_stellar_mass_hod_bands, plot_triangle
 
 fit = load_fit_plot_data("configs/my_run.yaml", label="LRG")
 
 plot_triangle(fit, params=["logMcut", "sigma", "logM1", "alpha", "LRG.number_density"])
 plot_fit_bands(fit, max_samples=1000)  # pass labels=[...] for overlaid runs
 plot_hod_bands(fit, max_samples=1000)
+# plot_stellar_mass_hod_bands(stellar_fit, max_samples=1000)
 plot_derived_parameters([fit], x_values=[0.8], x_label="redshift", derived_params=["LRG.linear_bias", "LRG.satellite_fraction", "LRG.log10_mh_cen_med", "LRG.log10_mh_sat_med"])
 # plot_joint_grid(plot_fit_bands, [[fit_a, fit_b], [fit_c, fit_d]], nrows=1, ncols=2)
 
@@ -162,17 +187,26 @@ print(fit.parameter_stats["LRG.number_density"].mean)
 
 - `fit.observables` order defines the theory/data vector order.
 - Supported statistics are `wp`, `xi0`, and `xi2`.
-- Observable `slice` is applied when data are read.
+- Observable `slice` is applied to both the loaded data and tabulated theory bins.
 - `covariance.mode: joint` expects the covariance shape to match the sliced combined data vector.
 - `covariance.mode: block` accepts either sliced block covariances or full pre-slice block covariances.
 - `covariance.precision_scale` multiplies the inverse covariance; pass a Hartlap factor there, or set `covariance_n_mocks` to let the code compute it.
+- Number-density mode `gaussian` penalizes only models below the target; `gaussian_two_sided` penalizes deviations in either direction.
+- `fit.parameter_constraints` can impose hard ordering with `{lower: parameter_a, upper: parameter_b}`.
 
 ## 9. Quick Checks
 
 ```bash
 python3 -m compileall source/abacustabulation scripts
+python3 -m unittest discover -s tests -v
+python3 tests/run_actual_data_smoke.py
 python3 scripts/prepare_profiles.py --help
 python3 scripts/compute_paircounts.py --help
 python3 scripts/compute_hmf.py --help
 python3 scripts/run_fit_optimize.py --help
 ```
+
+The actual-data smoke test reads `AbacusTabulation_data/` and writes
+clustering, HOD, and linear-bias diagnostics to `tests/plots/`. Use
+`--redshift 0.725` to select another prepared snapshot or
+`--skip-linear-bias` to avoid the cosmoprimo/CAMB calculation.
